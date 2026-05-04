@@ -2,9 +2,12 @@ import streamlit as st
 import base64
 from pathlib import Path
 
+# Caminho base do projeto (raiz)
+BASE_DIR = Path(__file__).resolve().parent.parent
+
 
 def get_base64_image(image_path: str) -> str:
-    image_file = Path(image_path)
+    image_file = BASE_DIR / image_path
     with open(image_file, "rb") as f:
         return base64.b64encode(f.read()).decode()
 
@@ -52,7 +55,8 @@ def show_sidebar_branding():
         """,
         unsafe_allow_html=True
     )
+
     st.sidebar.markdown(
-    "<p style='font-size:10px; text-align:center; color:gray;'>Developed by Silmar Sendin</p>",
-    unsafe_allow_html=True
-)
+        "<p style='font-size:10px; text-align:center; color:gray;'>Developed by Silmar Sendin</p>",
+        unsafe_allow_html=True
+    )
