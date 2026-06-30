@@ -20,7 +20,7 @@ st.write("This application contains the following tools:")
 st.markdown("""
 - Pipes Sizes  
 - Hanger  
-- Conections  
+- Connections  
 - Valves
 - Pump
 - Calculation
