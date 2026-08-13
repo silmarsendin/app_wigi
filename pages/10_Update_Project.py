@@ -135,6 +135,99 @@ FORECAST_QUERY_URL = (
 
 
 # =========================================================
+# SUPABASE CONFIGURATION
+# =========================================================
+#
+# Comments are stored in Supabase while Projects remain in
+# Notion. The link between both systems is the Notion page ID
+# stored in comments.notion_project_id.
+#
+# Recommended Streamlit secret names:
+#
+# SUPABASE_URL = "https://YOUR_PROJECT.supabase.co"
+# SUPABASE_SECRET_KEY = "sb_secret_..."
+#
+# The fallbacks below also support legacy/current alternative
+# names if they already exist in your app.
+# =========================================================
+
+SUPABASE_URL = (
+    st.secrets.get(
+        "SUPABASE_URL",
+        ""
+    )
+    or ""
+).strip().rstrip("/")
+
+
+SUPABASE_KEY = (
+    st.secrets.get(
+        "SUPABASE_SECRET_KEY",
+        ""
+    )
+    or st.secrets.get(
+        "SUPABASE_SERVICE_ROLE_KEY",
+        ""
+    )
+    or st.secrets.get(
+        "SUPABASE_PUBLISHABLE_KEY",
+        ""
+    )
+    or st.secrets.get(
+        "SUPABASE_ANON_KEY",
+        ""
+    )
+    or st.secrets.get(
+        "SUPABASE_KEY",
+        ""
+    )
+    or ""
+).strip()
+
+
+COMMENTS_TABLE_NAME = (
+    "comments"
+)
+
+
+def get_supabase_headers(
+    prefer=None,
+):
+
+    headers = {
+        "apikey":
+            SUPABASE_KEY,
+
+        "Content-Type":
+            "application/json",
+    }
+
+
+    # Legacy anon/service_role keys are JWTs and can also be
+    # sent as Bearer tokens. New sb_publishable_/sb_secret_
+    # keys use the apikey header.
+    if SUPABASE_KEY.startswith(
+        "eyJ"
+    ):
+
+        headers[
+            "Authorization"
+        ] = (
+            f"Bearer {SUPABASE_KEY}"
+        )
+
+
+    if prefer:
+
+        headers[
+            "Prefer"
+        ] = prefer
+
+
+    return headers
+
+
+# =========================================================
 # GENERAL HELPERS
 # =========================================================
 
@@ -1488,6 +1581,8 @@ selected_label = (
         index=None,
         placeholder=
             "Select a project to edit",
+        key=
+            "update_project_selected_project",
     )
 )
 
@@ -1514,6 +1609,60 @@ project_page_id = (
         "id"
     ]
 )
+
+
+# =========================================================
+# RESET PROJECT-DEPENDENT WIDGET STATE
+# =========================================================
+#
+# Streamlit preserves widget values between reruns. When the
+# selected Project changes, clear only the Forecast widgets
+# that use fixed keys. Project Information widgets below use
+# project_page_id in their keys, so they automatically load
+# the values belonging to the newly selected Project.
+# =========================================================
+
+previous_project_page_id = (
+    st.session_state.get(
+        "_update_project_previous_page_id"
+    )
+)
+
+
+if (
+    previous_project_page_id
+    and previous_project_page_id
+    != project_page_id
+):
+
+    project_dependent_fixed_keys = [
+        "new_forecast_building",
+        "new_forecast_type",
+        "new_forecast_type_text",
+        "new_forecast_date",
+        "new_forecast_done",
+        "forecast_event_to_update",
+        "edit_forecast_building",
+        "edit_forecast_type",
+        "edit_forecast_type_text",
+        "edit_forecast_date",
+        "edit_forecast_done",
+    ]
+
+
+    for widget_key in (
+        project_dependent_fixed_keys
+    ):
+
+        st.session_state.pop(
+            widget_key,
+            None,
+        )
+
+
+st.session_state[
+    "_update_project_previous_page_id"
+] = project_page_id
 
 
 current_properties = (
@@ -1617,6 +1766,8 @@ with col1:
             "Project Number *",
             value=
                 current_number,
+            key=
+                f"project_number_{project_page_id}",
         )
     )
 
@@ -1628,6 +1779,8 @@ with col2:
             "Project Name *",
             value=
                 current_name,
+            key=
+                f"project_name_{project_page_id}",
         )
     )
 
@@ -1686,6 +1839,8 @@ with col1:
                         available_designers,
                     index=
                         designer_index,
+                    key=
+                        f"project_designer_{project_page_id}",
                 )
             )
 
@@ -1697,6 +1852,8 @@ with col1:
                     "Designer",
                     value=
                         current_designer,
+                    key=
+                        f"project_designer_text_{project_page_id}",
                 )
             )
 
@@ -1714,6 +1871,8 @@ with col1:
             value=
                 designer,
             disabled=True,
+            key=
+                f"project_designer_disabled_{project_page_id}",
         )
 
 
@@ -1726,6 +1885,8 @@ with col2:
             step=1.0,
             value=
                 current_planned_hours,
+            key=
+                f"project_planned_hours_{project_page_id}",
         )
     )
 
@@ -1748,6 +1909,8 @@ with col1:
             step=0.5,
             value=
                 current_used_hours,
+            key=
+                f"project_used_hours_{project_page_id}",
         )
     )
 
@@ -1761,6 +1924,8 @@ with col2:
             step=0.5,
             value=
                 current_remaining_hours,
+            key=
+                f"project_remaining_hours_{project_page_id}",
         )
     )
 
@@ -1775,6 +1940,8 @@ with col3:
             step=1.0,
             value=
                 current_used_hours_percent,
+            key=
+                f"project_used_hours_percent_{project_page_id}",
         )
     )
 
@@ -1800,6 +1967,8 @@ place = (
             "Example: 699 Aero Lane, "
             "Sanford, FL 32771"
         ),
+        key=
+            f"project_place_{project_page_id}",
     )
 )
 
@@ -1868,6 +2037,8 @@ project_photo = (
         accept_multiple_files=False,
         help=
             "PNG files only.",
+        key=
+            f"project_photo_{project_page_id}",
     )
 )
 
@@ -1967,6 +2138,8 @@ update_project_button = (
         "💾 Update Project",
         type="primary",
         use_container_width=True,
+        key=
+            f"update_project_{project_page_id}",
     )
 )
 
@@ -2242,6 +2415,171 @@ if update_project_button:
                     st.code(
                         response.text
                     )
+
+
+# =========================================================
+# SUPABASE COMMENTS HELPERS
+# =========================================================
+
+def supabase_comments_configured():
+
+    return bool(
+        SUPABASE_URL
+        and SUPABASE_KEY
+    )
+
+
+def get_comments_url():
+
+    return (
+        f"{SUPABASE_URL}/rest/v1/"
+        f"{COMMENTS_TABLE_NAME}"
+    )
+
+
+def load_project_comments(
+    notion_project_id,
+):
+
+    if not supabase_comments_configured():
+
+        return []
+
+
+    response = requests.get(
+        get_comments_url(),
+        headers=
+            get_supabase_headers(),
+        params={
+            "select":
+                (
+                    "id,"
+                    "notion_project_id,"
+                    "project_number,"
+                    "comment_date,"
+                    "comment_text,"
+                    "created_by,"
+                    "created_at"
+                ),
+
+            "notion_project_id":
+                f"eq.{notion_project_id}",
+
+            "order":
+                "comment_date.desc",
+        },
+        timeout=30,
+    )
+
+
+    if response.status_code != 200:
+
+        raise Exception(
+            "Unable to retrieve Comments from Supabase.\n\n"
+            f"Status: {response.status_code}\n"
+            f"Response: {response.text}"
+        )
+
+
+    return response.json()
+
+
+def create_project_comment(
+    notion_project_id,
+    project_number,
+    comment_text,
+    created_by,
+):
+
+    if not supabase_comments_configured():
+
+        raise Exception(
+            "Supabase is not configured."
+        )
+
+
+    payload = {
+        "notion_project_id":
+            notion_project_id,
+
+        "project_number":
+            project_number,
+
+        "comment_text":
+            comment_text.strip(),
+
+        "created_by":
+            created_by,
+    }
+
+
+    response = requests.post(
+        get_comments_url(),
+        headers=
+            get_supabase_headers(
+                prefer=
+                    "return=representation"
+            ),
+        json=payload,
+        timeout=30,
+    )
+
+
+    if response.status_code not in [
+        200,
+        201,
+    ]:
+
+        raise Exception(
+            "Unable to save Comment in Supabase.\n\n"
+            f"Status: {response.status_code}\n"
+            f"Response: {response.text}"
+        )
+
+
+    try:
+
+        return response.json()
+
+    except ValueError:
+
+        return []
+
+
+def format_comment_date(
+    value,
+):
+
+    if not value:
+
+        return ""
+
+
+    try:
+
+        parsed_value = (
+            datetime.fromisoformat(
+                str(value)
+                .replace(
+                    "Z",
+                    "+00:00"
+                )
+            )
+        )
+
+
+        return (
+            parsed_value.strftime(
+                "%m/%d/%Y"
+            )
+        )
+
+
+    except Exception:
+
+        return str(
+            value
+        )[:10]
 
 
 # =========================================================
@@ -3381,3 +3719,288 @@ else:
                             st.code(
                                 response.text
                             )
+
+
+# =========================================================
+# SECTION 4
+# PROJECT COMMENTS
+# =========================================================
+
+st.divider()
+
+
+st.subheader(
+    "💬 Comments"
+)
+
+
+st.caption(
+    f"Comments for Project "
+    f"{current_number} - {current_name}."
+)
+
+
+# =========================================================
+# SUPABASE CONFIGURATION CHECK
+# =========================================================
+
+if not supabase_comments_configured():
+
+    st.warning(
+        "Supabase Comments is not configured yet."
+    )
+
+
+    with st.expander(
+        "Supabase configuration",
+        expanded=False,
+    ):
+
+        st.markdown(
+            """
+Add the following values to `.streamlit/secrets.toml`
+and to the Streamlit Cloud Secrets:
+
+```toml
+SUPABASE_URL = "https://YOUR_PROJECT.supabase.co"
+SUPABASE_SECRET_KEY = "sb_secret_..."
+```
+
+The application uses the Notion Project Page ID to connect
+each comment to the selected Project.
+"""
+        )
+
+
+else:
+
+    # =====================================================
+    # ADD NEW COMMENT
+    # =====================================================
+
+    with st.form(
+        key=
+            f"add_comment_form_"
+            f"{project_page_id}",
+        clear_on_submit=True,
+    ):
+
+        new_comment_text = (
+            st.text_area(
+                "New Comment",
+                placeholder=(
+                    "Enter a new comment "
+                    "for this Project..."
+                ),
+                height=120,
+                key=
+                    f"new_comment_text_"
+                    f"{project_page_id}",
+            )
+        )
+
+
+        comment_col1, comment_col2 = (
+            st.columns(
+                [
+                    3,
+                    1,
+                ]
+            )
+        )
+
+
+        with comment_col1:
+
+            st.caption(
+                f"Author: {logged_user_name}"
+            )
+
+
+        with comment_col2:
+
+            add_comment_button = (
+                st.form_submit_button(
+                    "➕ Add Comment",
+                    type="primary",
+                    use_container_width=True,
+                )
+            )
+
+
+    # =====================================================
+    # SAVE COMMENT
+    # =====================================================
+
+    if add_comment_button:
+
+        if not new_comment_text.strip():
+
+            st.error(
+                "Comment cannot be empty."
+            )
+
+
+        else:
+
+            try:
+
+                with st.spinner(
+                    "Saving Comment..."
+                ):
+
+                    create_project_comment(
+                        notion_project_id=
+                            project_page_id,
+
+                        project_number=
+                            current_number,
+
+                        comment_text=
+                            new_comment_text,
+
+                        created_by=
+                            logged_user_name,
+                    )
+
+
+            except Exception as error:
+
+                st.error(
+                    "The Comment could not be saved."
+                )
+
+
+                with st.expander(
+                    "Technical details"
+                ):
+
+                    st.code(
+                        str(error)
+                    )
+
+
+            else:
+
+                st.success(
+                    "Comment added successfully!"
+                )
+
+
+                st.rerun()
+
+
+    # =====================================================
+    # LOAD PREVIOUS COMMENTS
+    # =====================================================
+
+    st.markdown(
+        "#### Previous Comments"
+    )
+
+
+    try:
+
+        project_comments = (
+            load_project_comments(
+                project_page_id
+            )
+        )
+
+
+    except Exception as error:
+
+        st.error(
+            "Unable to load Comments."
+        )
+
+
+        with st.expander(
+            "Technical details"
+        ):
+
+            st.code(
+                str(error)
+            )
+
+
+        project_comments = []
+
+
+    # =====================================================
+    # DISPLAY COMMENTS
+    # =====================================================
+
+    if not project_comments:
+
+        st.info(
+            "There are no Comments "
+            "registered for this Project."
+        )
+
+
+    else:
+
+        comments_display = []
+
+
+        for comment in (
+            project_comments
+        ):
+
+            comments_display.append(
+                {
+                    "Date":
+                        format_comment_date(
+                            comment.get(
+                                "comment_date"
+                            )
+                            or comment.get(
+                                "created_at"
+                            )
+                        ),
+
+                    "Comment":
+                        (
+                            comment.get(
+                                "comment_text"
+                            )
+                            or ""
+                        ),
+
+                    "Author":
+                        (
+                            comment.get(
+                                "created_by"
+                            )
+                            or "—"
+                        ),
+                }
+            )
+
+
+        st.dataframe(
+            comments_display,
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "Date":
+                    st.column_config.TextColumn(
+                        "Date",
+                        width="small",
+                    ),
+
+                "Comment":
+                    st.column_config.TextColumn(
+                        "Comment",
+                        width="large",
+                    ),
+
+                "Author":
+                    st.column_config.TextColumn(
+                        "Author",
+                        width="medium",
+                    ),
+            },
+        )
+

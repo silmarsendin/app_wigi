@@ -7,3 +7,5 @@ reportlab
 streamlit-calendar
 resend
 msal
+folium
+streamlit-folium

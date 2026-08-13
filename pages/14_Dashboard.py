@@ -2,6 +2,8 @@ import streamlit as st
 import requests
 import pandas as pd
 import plotly.express as px
+import pydeck as pdk
+import time
 
 from datetime import date, datetime
 
@@ -124,7 +126,7 @@ NOTION_HEADERS = {
 }
 
 
-CACHE_TTL = 300
+CACHE_TTL = 30
 
 
 # =========================================================
@@ -670,12 +672,10 @@ def load_users():
     )
 
 
-@st.cache_data(
-    ttl=CACHE_TTL,
-    show_spinner=False
-)
 def load_projects():
 
+    # Projects are intentionally loaded without Streamlit cache so that
+    # recently edited Notion fields are read on every dashboard refresh.
     return query_data_source(
         NOTION_PROJECTS_DATA_SOURCE_ID
     )
@@ -1225,12 +1225,477 @@ def find_checkbox_field(
 
 
 # =========================================================
+# PROJECT / MAP HELPERS
+# =========================================================
+
+def get_property_by_aliases(
+    properties,
+    aliases
+):
+
+    normalized_properties = {
+        normalize_text(name): prop
+        for name, prop in properties.items()
+    }
+
+    for alias in aliases:
+
+        prop = normalized_properties.get(
+            normalize_text(alias)
+        )
+
+        if prop is not None:
+            return prop
+
+    return {}
+
+
+def get_text_by_aliases(
+    properties,
+    aliases,
+    default=""
+):
+
+    prop = get_property_by_aliases(
+        properties,
+        aliases
+    )
+
+    value = get_property_plain_text(
+        prop
+    )
+
+    return (
+        str(value).strip()
+        if value not in (None, "")
+        else default
+    )
+
+
+def to_float(
+    value
+):
+
+    if value is None:
+        return None
+
+    if isinstance(value, str):
+        value = value.strip().replace(",", ".")
+
+    if value == "":
+        return None
+
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def get_number_by_aliases(
+    properties,
+    aliases
+):
+
+    prop = get_property_by_aliases(
+        properties,
+        aliases
+    )
+
+    if not prop:
+        return None
+
+    prop_type = prop.get(
+        "type"
+    )
+
+    if prop_type == "number":
+        return to_float(
+            prop.get("number")
+        )
+
+    # Also accepts formula / rollup / rich text values if coordinates
+    # were created in Notion using one of those property types.
+    return to_float(
+        get_property_plain_text(prop)
+    )
+
+
+@st.cache_data(
+    ttl=3600,
+    show_spinner=False
+)
+def geocode_project_address(
+    address
+):
+
+    import re
+
+    original_address = str(address or "").strip()
+
+    if not original_address:
+        return None, None, "No address", ""
+
+    # Nominatim can have difficulty with suite/unit information.
+    # Try the original address first, followed by progressively
+    # simplified versions.
+    candidates = []
+
+    def add_candidate(value):
+        value = re.sub(r"\s+", " ", str(value or "")).strip(" ,")
+        if value and value not in candidates:
+            candidates.append(value)
+
+    add_candidate(original_address)
+
+    # Remove common suite/unit designators while keeping the street address.
+    without_suite = re.sub(
+        r"(?i)(?:,?\s+|\s+)(?:suite|ste\.?|unit|#)\s*[A-Za-z0-9-]+(?=,|$)",
+        "",
+        original_address,
+    )
+    add_candidate(without_suite)
+
+    # Add commas before a US state abbreviation and ZIP when the address
+    # was entered as plain text without separators.
+    formatted = re.sub(
+        r"\s+([A-Z]{2})\s+(\d{5}(?:-\d{4})?)$",
+        r", \1 \2",
+        without_suite,
+    )
+    add_candidate(formatted)
+
+    last_status = "Not found"
+
+    for candidate in candidates:
+        try:
+            response = requests.get(
+                "https://nominatim.openstreetmap.org/search",
+                params={
+                    "q": candidate,
+                    "format": "jsonv2",
+                    "limit": 1,
+                    "addressdetails": 1,
+                    "countrycodes": "us",
+                },
+                headers={
+                    "User-Agent":
+                        "WigintonToolsProjectDashboard/1.1 (project-map-geocoder)"
+                },
+                timeout=20,
+            )
+
+            if response.status_code != 200:
+                last_status = f"HTTP {response.status_code}"
+                continue
+
+            results = response.json()
+
+            if not results:
+                last_status = "Not found"
+                continue
+
+            latitude = to_float(results[0].get("lat"))
+            longitude = to_float(results[0].get("lon"))
+
+            if latitude is not None and longitude is not None:
+                return latitude, longitude, "Located", candidate
+
+        except requests.RequestException as error:
+            last_status = f"Request error: {type(error).__name__}"
+        except (ValueError, TypeError):
+            last_status = "Invalid response"
+
+    return None, None, last_status, " | ".join(candidates)
+
+
+def build_project_map_dataframe(
+    projects_dataframe
+):
+
+    map_rows = []
+    missing_rows = []
+    geocoding_used = False
+
+    for _, row in projects_dataframe.iterrows():
+
+        address = str(row.get("Address", "") or "").strip()
+        latitude = to_float(row.get("Latitude"))
+        longitude = to_float(row.get("Longitude"))
+
+        geocoding_status = "Stored coordinates"
+        geocoding_query = ""
+
+        if (latitude is None or longitude is None) and address:
+            if geocoding_used:
+                time.sleep(1.05)
+
+            latitude, longitude, geocoding_status, geocoding_query = (
+                geocode_project_address(address)
+            )
+            geocoding_used = True
+
+        elif not address and (latitude is None or longitude is None):
+            geocoding_status = "No address"
+
+        valid_coordinates = (
+            latitude is not None
+            and longitude is not None
+            and -90 <= latitude <= 90
+            and -180 <= longitude <= 180
+        )
+
+        common = {
+            "Project": row.get("Project", "—"),
+            "Project Name": row.get("Project Name", "—"),
+            "Designer": row.get("Designer", "—"),
+            "Status": row.get("Status", "—"),
+            "Address": address or "No address",
+            "Address Source": row.get("Address Source", "Empty"),
+            "Address Direct Result": row.get("Address Direct Result", ""),
+            "Geocoding Status": geocoding_status,
+            "Geocoding Query": geocoding_query,
+            "Latitude": latitude,
+            "Longitude": longitude,
+        }
+
+        if valid_coordinates:
+            map_rows.append({
+                **common,
+                "lat": latitude,
+                "lon": longitude,
+            })
+        else:
+            missing_rows.append(common)
+
+    return pd.DataFrame(map_rows), pd.DataFrame(missing_rows)
+
+
+# =========================================================
+# NOTION DATA SOURCE / PROPERTY HELPERS
+# =========================================================
+
+def retrieve_data_source_schema(
+    data_source_id
+):
+
+    if not data_source_id:
+        return {}
+
+    try:
+        response = requests.get(
+            f"https://api.notion.com/v1/data_sources/{data_source_id}",
+            headers=NOTION_HEADERS,
+            timeout=20,
+        )
+    except requests.RequestException:
+        return {}
+
+    if response.status_code != 200:
+        return {}
+
+    try:
+        return response.json()
+    except ValueError:
+        return {}
+
+
+def get_data_source_property_info(
+    data_source_schema,
+    property_name
+):
+
+    properties = (
+        data_source_schema.get(
+            "properties",
+            {}
+        )
+        if data_source_schema
+        else {}
+    )
+
+    target = normalize_text(
+        property_name
+    )
+
+    for name, prop in properties.items():
+
+        if normalize_text(name) != target:
+            continue
+
+        return {
+            "name": name,
+            "id": prop.get("id") or "",
+            "type": prop.get("type") or "",
+        }
+
+    return {
+        "name": property_name,
+        "id": "",
+        "type": "",
+    }
+
+
+def extract_text_from_property_item_response(
+    data
+):
+
+    if not data:
+        return ""
+
+    # Rich text/title properties can be returned as a paginated list of
+    # property_item objects. Each result contains the rich_text/title object.
+    if data.get("object") == "list":
+
+        parts = []
+
+        for item in data.get("results", []):
+            item_type = item.get("type")
+
+            if item_type in {"rich_text", "title"}:
+                content = item.get(item_type) or {}
+                plain_text = content.get("plain_text") or ""
+                if plain_text:
+                    parts.append(plain_text)
+
+            elif item_type == "formula":
+                formula = item.get("formula") or {}
+                formula_type = formula.get("type")
+                value = formula.get(formula_type)
+                if value not in (None, ""):
+                    parts.append(str(value))
+
+        return "".join(parts).strip()
+
+    # Some property types are returned as a single property_item object.
+    item_type = data.get("type")
+
+    if item_type in {"rich_text", "title"}:
+        content = data.get(item_type) or {}
+        return str(
+            content.get("plain_text") or ""
+        ).strip()
+
+    if item_type == "number":
+        value = data.get("number")
+        return "" if value is None else str(value)
+
+    if item_type == "select":
+        value = data.get("select") or {}
+        return str(value.get("name") or "").strip()
+
+    if item_type == "status":
+        value = data.get("status") or {}
+        return str(value.get("name") or "").strip()
+
+    if item_type == "email":
+        return str(data.get("email") or "").strip()
+
+    if item_type == "url":
+        return str(data.get("url") or "").strip()
+
+    if item_type == "phone_number":
+        return str(data.get("phone_number") or "").strip()
+
+    if item_type == "formula":
+        formula = data.get("formula") or {}
+        formula_type = formula.get("type")
+        value = formula.get(formula_type)
+        return "" if value is None else str(value).strip()
+
+    return ""
+
+
+def load_page_property_direct(
+    page_id,
+    property_id
+):
+
+    if not page_id or not property_id:
+        return {}, "Missing page/property ID"
+
+    try:
+        response = requests.get(
+            f"https://api.notion.com/v1/pages/{page_id}/properties/{property_id}",
+            headers=NOTION_HEADERS,
+            timeout=20,
+        )
+    except requests.RequestException as error:
+        return {}, f"Request error: {error}"
+
+    if response.status_code != 200:
+        return {}, f"HTTP {response.status_code}"
+
+    try:
+        return response.json(), "OK"
+    except ValueError:
+        return {}, "Invalid JSON"
+
+
+def get_page_property_text_direct(
+    page_id,
+    property_id
+):
+
+    data, result = load_page_property_direct(
+        page_id,
+        property_id
+    )
+
+    if result != "OK":
+        return "", result
+
+    value = extract_text_from_property_item_response(
+        data
+    )
+
+    return value, "OK" if value else "Empty value"
+
+
+# =========================================================
+# DIRECT NOTION PAGE FALLBACK
+# =========================================================
+
+def load_project_page_direct(page_id):
+
+    if not page_id:
+        return {}
+
+    try:
+        response = requests.get(
+            f"https://api.notion.com/v1/pages/{page_id}",
+            headers=NOTION_HEADERS,
+            timeout=20,
+        )
+    except requests.RequestException:
+        return {}
+
+    if response.status_code != 200:
+        return {}
+
+    try:
+        return response.json()
+    except ValueError:
+        return {}
+
+
+def get_direct_project_properties(page_id):
+
+    return load_project_page_direct(
+        page_id
+    ).get(
+        "properties",
+        {}
+    )
+
+
+# =========================================================
 # BUILD BRANCH PROJECT DATA
 # =========================================================
 
 def build_branch_projects(
     project_pages,
-    branch_users
+    branch_users,
+    place_property_info=None
 ):
 
     rows = []
@@ -1298,6 +1763,146 @@ def build_branch_projects(
         )
 
 
+        # IMPORTANT:
+        # 10_Update_Project.py stores the project address in the Notion
+        # property named "Place" as rich_text. Therefore Place must be the
+        # primary source used by the Dashboard map.
+        #
+        # "Address" is kept only as a fallback for older records that may
+        # still use the previous field name.
+        project_address = get_text_by_aliases(
+            properties,
+            ["Place", "Address"],
+            ""
+        )
+
+        if project_address:
+            place_from_query = get_text_by_aliases(
+                properties,
+                ["Place"],
+                ""
+            )
+            address_source = (
+                "Query - Place"
+                if place_from_query
+                else "Query - Address fallback"
+            )
+        else:
+            address_source = ""
+
+        address_direct_result = (
+            "Not needed"
+            if project_address
+            else "Not attempted"
+        )
+
+        direct_properties = None
+
+        place_property_id = (
+            (place_property_info or {}).get("id")
+            or ""
+        )
+
+        # If Place was not included / populated in the normal query result,
+        # retrieve the exact Place property directly from the Notion page.
+        if not project_address and place_property_id:
+            project_address, address_direct_result = (
+                get_page_property_text_direct(
+                    page.get("id") or "",
+                    place_property_id
+                )
+            )
+
+            if project_address:
+                address_source = "Direct Property - Place"
+
+        # Final fallback: retrieve the whole page and inspect Place first,
+        # then Address for compatibility with older Projects.
+        if not project_address:
+            direct_properties = get_direct_project_properties(
+                page.get("id") or ""
+            )
+
+            project_address = get_text_by_aliases(
+                direct_properties,
+                ["Place", "Address"],
+                ""
+            )
+
+            if project_address:
+                direct_place = get_text_by_aliases(
+                    direct_properties,
+                    ["Place"],
+                    ""
+                )
+
+                address_source = (
+                    "Direct Page - Place"
+                    if direct_place
+                    else "Direct Page - Address fallback"
+                )
+
+        if not address_source:
+            address_source = "Empty"
+
+
+        project_status = (
+            get_text_by_aliases(
+                properties,
+                [
+                    "Status",
+                    "Project Status",
+                    "Project Phase",
+                    "Phase",
+                ],
+                ""
+            )
+        )
+
+
+        project_latitude = (
+            get_number_by_aliases(
+                properties,
+                [
+                    "Latitude",
+                    "Lat",
+                    "Project Latitude",
+                ]
+            )
+        )
+
+
+        project_longitude = (
+            get_number_by_aliases(
+                properties,
+                [
+                    "Longitude",
+                    "Lon",
+                    "Lng",
+                    "Project Longitude",
+                ]
+            )
+        )
+
+        if project_latitude is None or project_longitude is None:
+            if direct_properties is None:
+                direct_properties = get_direct_project_properties(
+                    page.get("id") or ""
+                )
+
+            if project_latitude is None:
+                project_latitude = get_number_by_aliases(
+                    direct_properties,
+                    ["Latitude", "Lat", "Project Latitude"]
+                )
+
+            if project_longitude is None:
+                project_longitude = get_number_by_aliases(
+                    direct_properties,
+                    ["Longitude", "Lon", "Lng", "Project Longitude"]
+                )
+
+
         installed = (
             get_checkbox(
                 properties,
@@ -1305,6 +1910,14 @@ def build_branch_projects(
                 False
             )
         )
+
+
+        if not project_status:
+            project_status = (
+                "Installed"
+                if installed
+                else "Active"
+            )
 
 
         milestone_values = {}
@@ -1384,6 +1997,24 @@ def build_branch_projects(
                     matched_user[
                         "email"
                     ],
+
+                "Address":
+                    project_address,
+
+                "Address Source":
+                    address_source,
+
+                "Address Direct Result":
+                    address_direct_result,
+
+                "Status":
+                    project_status,
+
+                "Latitude":
+                    project_latitude,
+
+                "Longitude":
+                    project_longitude,
 
                 "Installed":
                     installed,
@@ -1641,6 +2272,17 @@ st.title(
     "📊 Branch Dashboard"
 )
 
+refresh_col1, refresh_col2 = st.columns([1, 5])
+
+with refresh_col1:
+    if st.button(
+        "🔄 Refresh Data",
+        use_container_width=True,
+    ):
+        st.cache_data.clear()
+        st.rerun()
+
+
 
 st.caption(
     "Branch-wide project, productivity, milestone and permit performance."
@@ -1718,6 +2360,24 @@ with st.spinner(
     )
 
 
+    projects_data_source_schema = (
+        retrieve_data_source_schema(
+            NOTION_PROJECTS_DATA_SOURCE_ID
+        )
+    )
+
+
+    # 10_Update_Project.py uses the Projects property named "Place".
+    # Read the same property here so the Dashboard and Update Project page
+    # use one consistent source of truth for project location.
+    place_property_info = (
+        get_data_source_property_info(
+            projects_data_source_schema,
+            "Place"
+        )
+    )
+
+
     project_pages = (
         load_projects()
     )
@@ -1726,7 +2386,8 @@ with st.spinner(
     branch_projects = (
         build_branch_projects(
             project_pages,
-            branch_users
+            branch_users,
+            place_property_info
         )
     )
 
@@ -2640,3 +3301,261 @@ st.dataframe(
     use_container_width=True,
     hide_index=True,
 )
+
+# =========================================================
+# PROJECT MAP
+# =========================================================
+
+st.divider()
+
+st.subheader(
+    "Project Map"
+)
+
+st.caption(
+    "All projects in this Branch with a valid project address or "
+    "Latitude/Longitude are displayed on the map. Hover over a marker "
+    "to view the project information."
+)
+
+
+with st.spinner(
+    "Locating project addresses..."
+):
+
+    map_df, missing_map_df = (
+        build_project_map_dataframe(
+            projects_df
+        )
+    )
+
+
+if map_df.empty:
+
+    st.warning(
+        "No projects could be displayed on the map. "
+        "Verify that the Projects database contains a valid "
+        "Place for each project."
+    )
+
+else:
+
+    st.success(
+        f"{len(map_df)} project(s) displayed on the map."
+    )
+
+    # -----------------------------------------------------
+    # CREATE PYDECK-SAFE FIELD NAMES
+    # -----------------------------------------------------
+
+    map_deck_df = map_df.copy()
+
+    map_deck_df["project_number"] = (
+        map_deck_df["Project"]
+        .fillna("")
+        .astype(str)
+    )
+
+    map_deck_df["project_name"] = (
+        map_deck_df["Project Name"]
+        .fillna("")
+        .astype(str)
+    )
+
+    map_deck_df["designer_name"] = (
+        map_deck_df["Designer"]
+        .fillna("")
+        .astype(str)
+    )
+
+    map_deck_df["project_status"] = (
+        map_deck_df["Status"]
+        .fillna("")
+        .astype(str)
+    )
+
+    map_deck_df["project_address"] = (
+        map_deck_df["Address"]
+        .fillna("")
+        .astype(str)
+    )
+
+    map_deck_df["lat"] = pd.to_numeric(
+        map_deck_df["lat"],
+        errors="coerce",
+    )
+
+    map_deck_df["lon"] = pd.to_numeric(
+        map_deck_df["lon"],
+        errors="coerce",
+    )
+
+    map_deck_df = (
+        map_deck_df[
+            map_deck_df["lat"].notna()
+            & map_deck_df["lon"].notna()
+        ]
+        .copy()
+    )
+
+
+    if map_deck_df.empty:
+
+        st.warning(
+            "The project addresses were located, but no valid "
+            "Latitude/Longitude values are available for the map."
+        )
+
+    else:
+
+        # -------------------------------------------------
+        # MAP CENTER / ZOOM
+        # -------------------------------------------------
+
+        center_lat = float(
+            map_deck_df["lat"].mean()
+        )
+
+        center_lon = float(
+            map_deck_df["lon"].mean()
+        )
+
+        if len(map_deck_df) == 1:
+            map_zoom = 11.5
+
+        else:
+            lat_span = float(
+                map_deck_df["lat"].max()
+                - map_deck_df["lat"].min()
+            )
+
+            lon_span = float(
+                map_deck_df["lon"].max()
+                - map_deck_df["lon"].min()
+            )
+
+            max_span = max(
+                lat_span,
+                lon_span,
+            )
+
+            if max_span < 0.03:
+                map_zoom = 12.0
+            elif max_span < 0.08:
+                map_zoom = 10.5
+            elif max_span < 0.20:
+                map_zoom = 9.0
+            elif max_span < 0.50:
+                map_zoom = 8.0
+            elif max_span < 1.00:
+                map_zoom = 7.0
+            elif max_span < 3.00:
+                map_zoom = 5.5
+            elif max_span < 8.00:
+                map_zoom = 4.5
+            else:
+                map_zoom = 3.5
+
+
+        # -------------------------------------------------
+        # INTERACTIVE PROJECT MARKERS
+        # -------------------------------------------------
+
+        project_layer = pdk.Layer(
+            "ScatterplotLayer",
+            data=map_deck_df,
+            get_position="[lon, lat]",
+            get_radius=120,
+            radius_min_pixels=8,
+            radius_max_pixels=18,
+            pickable=True,
+            auto_highlight=True,
+            stroked=True,
+            filled=True,
+            get_fill_color=[220, 70, 55, 210],
+            get_line_color=[255, 255, 255, 255],
+            line_width_min_pixels=2,
+        )
+
+
+        view_state = pdk.ViewState(
+            latitude=center_lat,
+            longitude=center_lon,
+            zoom=map_zoom,
+            pitch=0,
+            bearing=0,
+        )
+
+
+        tooltip = {
+            "html": """
+                <div style="font-family: Arial, sans-serif; min-width: 280px;">
+                    <div style="font-size: 16px; font-weight: 700; margin-bottom: 8px;">
+                        {project_name}
+                    </div>
+                    <div><b>Project:</b> {project_number}</div>
+                    <div><b>Designer:</b> {designer_name}</div>
+                    <div><b>Status:</b> {project_status}</div>
+                    <div style="margin-top: 6px;">
+                        <b>Address:</b> {project_address}
+                    </div>
+                </div>
+            """,
+            "style": {
+                "backgroundColor": "#222222",
+                "color": "white",
+                "fontSize": "13px",
+                "padding": "10px",
+                "borderRadius": "8px",
+            },
+        }
+
+
+        deck = pdk.Deck(
+            layers=[
+                project_layer
+            ],
+            initial_view_state=view_state,
+            tooltip=tooltip,
+        )
+
+
+        st.pydeck_chart(
+            deck,
+            use_container_width=True,
+            height=650,
+        )
+
+
+        st.caption(
+            "Move the mouse directly over a project marker to display "
+            "Project Number, Project Name, Designer, Status and Address."
+        )
+
+
+        with st.expander(
+            "View mapped project details",
+            expanded=False,
+        ):
+
+            mapped_columns = [
+                "Project",
+                "Project Name",
+                "Designer",
+                "Status",
+                "Address",
+            ]
+
+            st.dataframe(
+                map_df[
+                    mapped_columns
+                ].sort_values(
+                    [
+                        "Designer",
+                        "Project",
+                    ]
+                ),
+                use_container_width=True,
+                hide_index=True,
+            )
+
