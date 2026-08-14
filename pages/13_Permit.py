@@ -2036,6 +2036,43 @@ if save_new:
 
 
 # =========================================================
+# RESET EDIT PERMIT STATE
+# =========================================================
+
+def reset_edit_permit_fields(
+    clear_selection=False
+):
+
+    keys_to_clear = [
+        "edit_project",
+        "edit_building",
+        "edit_type",
+        "edit_type_new",
+        "edit_ahj",
+        "edit_ahj_new",
+        "edit_has_submitted",
+        "edit_submitted_date",
+        "edit_has_approved",
+        "edit_approved_date",
+        "update_permit_button",
+    ]
+
+    for key in keys_to_clear:
+
+        st.session_state.pop(
+            key,
+            None
+        )
+
+    if clear_selection:
+
+        st.session_state.pop(
+            "edit_permit_selection",
+            None
+        )
+
+
+# =========================================================
 # EXISTING PERMITS / UPDATE
 # =========================================================
 
@@ -2111,6 +2148,8 @@ with st.expander(
                     "Select an existing Permit...",
                 key=
                     "edit_permit_selection",
+                on_change=
+                    reset_edit_permit_fields,
             )
         )
 
@@ -2223,17 +2262,21 @@ with st.expander(
 
 
             # =============================================
-            # EDIT FORM
+            # EDIT PERMIT
             # =============================================
+            # This section intentionally does NOT use st.form().
+            # Streamlit forms batch widget changes and do not
+            # rerun immediately, which prevented Approved Date
+            # from appearing as soon as the Approved checkbox
+            # was selected.
 
-            with st.form(
-                "edit_permit_form"
+            with st.container(
+                border=True
             ):
 
                 edit_col1, edit_col2 = (
                     st.columns(2)
                 )
-
 
                 with edit_col1:
 
@@ -2249,7 +2292,6 @@ with st.expander(
                         )
                     )
 
-
                 with edit_col2:
 
                     edit_building = (
@@ -2261,14 +2303,14 @@ with st.expander(
                                 ],
                             placeholder=
                                 "Example: Building 100 or Total",
+                            key=
+                                "edit_building",
                         )
                     )
-
 
                 edit_col3, edit_col4 = (
                     st.columns(2)
                 )
-
 
                 with edit_col3:
 
@@ -2281,7 +2323,6 @@ with st.expander(
                         )
                     )
 
-
                 with edit_col4:
 
                     edit_ahj = (
@@ -2293,11 +2334,9 @@ with st.expander(
                         )
                     )
 
-
                 edit_col5, edit_col6 = (
                     st.columns(2)
                 )
-
 
                 with edit_col5:
 
@@ -2310,12 +2349,12 @@ with st.expander(
                                 ]
                                 is not None
                             ),
+                            key=
+                                "edit_has_submitted",
                         )
                     )
 
-
                     edit_submitted_date = None
-
 
                     if edit_has_submitted:
 
@@ -2328,9 +2367,10 @@ with st.expander(
                                     ]
                                     or date.today()
                                 ),
+                                key=
+                                    "edit_submitted_date",
                             )
                         )
-
 
                 with edit_col6:
 
@@ -2343,12 +2383,12 @@ with st.expander(
                                 ]
                                 is not None
                             ),
+                            key=
+                                "edit_has_approved",
                         )
                     )
 
-
                     edit_approved_date = None
-
 
                     if edit_has_approved:
 
@@ -2361,18 +2401,20 @@ with st.expander(
                                     ]
                                     or date.today()
                                 ),
+                                key=
+                                    "edit_approved_date",
                             )
                         )
 
-
                 st.write("")
 
-
                 update_button = (
-                    st.form_submit_button(
+                    st.button(
                         "💾 Update Permit",
                         type="primary",
                         use_container_width=True,
+                        key=
+                            "update_permit_button",
                     )
                 )
 
@@ -2476,8 +2518,14 @@ with st.expander(
                             "Permit successfully updated!"
                         )
 
-
                         st.cache_data.clear()
+
+                        # Return the Update Permit section to its
+                        # initial state so the user must choose
+                        # another Permit before editing again.
+                        reset_edit_permit_fields(
+                            clear_selection=True
+                        )
 
                         st.rerun()
 

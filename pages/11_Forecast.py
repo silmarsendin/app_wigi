@@ -36,6 +36,26 @@ logged_user_name = (
     or ""
 ).strip()
 
+logged_user_role = (
+    st.session_state.get("user_role")
+    or "Designer"
+).strip()
+
+logged_user_branch = (
+    st.session_state.get("user_branch")
+    or ""
+).strip()
+
+logged_user_email = (
+    st.session_state.get("user_email")
+    or ""
+).strip()
+
+is_manager = (
+    logged_user_role.casefold()
+    == "manager"
+)
+
 if not logged_user_name:
 
     st.error(
@@ -50,6 +70,12 @@ if not logged_user_name:
 # =========================================================
 
 NOTION_TOKEN = st.secrets["NOTION_TOKEN"]
+
+NOTION_USERS_DATA_SOURCE_ID = (
+    st.secrets.get("NOTION_USERS_DATA_SOURCE_ID")
+    or st.secrets.get("USERS_DATA_SOURCE_ID")
+    or st.secrets.get("NOTION_USERS_DATABASE_ID")
+)
 
 FORECAST_DATA_SOURCE_ID = (
     st.secrets["NOTION_FORECAST_DATA_SOURCE_ID"]
@@ -689,6 +715,244 @@ def get_project_number_from_relation(
 
 
     return ""
+
+
+# =========================================================
+# USERS / BRANCH DESIGNERS
+# =========================================================
+
+@st.cache_data(
+    ttl=300,
+    show_spinner=False
+)
+def load_users():
+
+    if not NOTION_USERS_DATA_SOURCE_ID:
+        return []
+
+    url = (
+        "https://api.notion.com/v1/data_sources/"
+        f"{NOTION_USERS_DATA_SOURCE_ID}/query"
+    )
+
+    records = []
+    payload = {
+        "page_size": 100
+    }
+
+    while True:
+
+        try:
+            response = requests.post(
+                url,
+                headers=HEADERS,
+                json=payload,
+                timeout=30,
+            )
+
+        except requests.RequestException:
+            return []
+
+        if response.status_code != 200:
+            return []
+
+        data = response.json()
+
+        records.extend(
+            data.get(
+                "results",
+                []
+            )
+        )
+
+        if not data.get(
+            "has_more"
+        ):
+            break
+
+        next_cursor = data.get(
+            "next_cursor"
+        )
+
+        if not next_cursor:
+            break
+
+        payload[
+            "start_cursor"
+        ] = next_cursor
+
+    return records
+
+
+def get_users_for_branch(
+    branch_name
+):
+
+    if not branch_name:
+        return []
+
+    target_branch = normalize_text(
+        branch_name
+    )
+
+    users = []
+
+    for page in load_users():
+
+        properties = page.get(
+            "properties",
+            {}
+        )
+
+        branch = get_property_text(
+            properties.get(
+                "Branch"
+            )
+        )
+
+        if (
+            normalize_text(branch)
+            != target_branch
+        ):
+            continue
+
+        active_prop = properties.get(
+            "Active",
+            {}
+        )
+
+        if (
+            active_prop
+            and active_prop.get("type")
+            == "checkbox"
+            and not get_checkbox(active_prop)
+        ):
+            continue
+
+        name = get_property_text(
+            properties.get(
+                "Name"
+            )
+        ).strip()
+
+        if not name:
+            # Fallback to the first title property.
+            for prop in properties.values():
+                if prop.get("type") == "title":
+                    name = get_property_text(
+                        prop
+                    ).strip()
+
+                    if name:
+                        break
+
+        role = get_property_text(
+            properties.get(
+                "Role"
+            )
+        ).strip()
+
+        email = get_property_text(
+            properties.get(
+                "Email"
+            )
+        ).strip()
+
+        if name:
+            users.append(
+                {
+                    "name": name,
+                    "role": role,
+                    "email": email,
+                    "branch": branch,
+                }
+            )
+
+    # Remove duplicates while preserving a predictable order.
+    unique = {}
+
+    for user in users:
+        unique[
+            normalize_text(
+                user["name"]
+            )
+        ] = user
+
+    return sorted(
+        unique.values(),
+        key=lambda user:
+            user["name"].casefold()
+    )
+
+
+def get_manager_designer_names():
+
+    branch_users = (
+        get_users_for_branch(
+            logged_user_branch
+        )
+    )
+
+    # We include users whose Role is Designer.
+    # If the Users table has no Role filled in, keep the user
+    # available so a valid Forecast Designer is not hidden.
+    designer_names = []
+
+    for user in branch_users:
+
+        role = normalize_text(
+            user.get("role")
+        )
+
+        if (
+            not role
+            or role == "designer"
+        ):
+            designer_names.append(
+                user["name"]
+            )
+
+    # Also include designers actually present in Forecast records
+    # when they match someone in the same branch.
+    branch_name_lookup = {
+        normalize_text(
+            user["name"]
+        ): user["name"]
+        for user in branch_users
+    }
+
+    for event in all_events:
+        designer = (
+            event.get(
+                "extendedProps",
+                {}
+            ).get(
+                "designer",
+                ""
+            )
+            or ""
+        ).strip()
+
+        normalized_designer = (
+            normalize_text(
+                designer
+            )
+        )
+
+        if (
+            normalized_designer
+            in branch_name_lookup
+        ):
+            designer_names.append(
+                branch_name_lookup[
+                    normalized_designer
+                ]
+            )
+
+    return sorted(
+        set(designer_names),
+        key=str.casefold
+    )
 
 
 # =========================================================
@@ -1363,33 +1627,67 @@ all_events = (
 
 
 # =========================================================
-# LOGGED USER PROJECT FILTER
+# DESIGNER / MANAGER VISIBILITY FILTER
 # =========================================================
-# From this point forward, every section of Forecast.py uses
-# only Projects where the logged-in user is the Designer.
+#
+# Designer:
+#   - sees only their own Forecast records.
+#
+# Manager:
+#   - sees Forecast records assigned to Designers in the
+#     Manager's Branch.
+#   - can later select one Designer or All.
+# =========================================================
 
-events = [
-    event
-    for event in all_events
-    if normalize_text(
-        event.get(
-            "extendedProps",
-            {}
-        ).get(
-            "designer",
-            ""
+if is_manager:
+
+    manager_designer_names = (
+        get_manager_designer_names()
+    )
+
+    allowed_designer_names = {
+        normalize_text(name)
+        for name in manager_designer_names
+    }
+
+    events = [
+        event
+        for event in all_events
+        if normalize_text(
+            event.get(
+                "extendedProps",
+                {}
+            ).get(
+                "designer",
+                ""
+            )
         )
-    )
-    == normalize_text(
-        logged_user_name
-    )
-]
+        in allowed_designer_names
+    ]
+
+else:
+
+    manager_designer_names = []
+
+    events = [
+        event
+        for event in all_events
+        if normalize_text(
+            event.get(
+                "extendedProps",
+                {}
+            ).get(
+                "designer",
+                ""
+            )
+        )
+        == normalize_text(
+            logged_user_name
+        )
+    ]
 
 
-# Keep only Forecast records that generated events belonging
-# to the logged-in Designer. This also makes the Forecast
-# Records metric user-specific.
-logged_user_forecast_page_ids = {
+visible_forecast_page_ids = {
     event.get("id")
     for event in events
     if event.get("id")
@@ -1399,8 +1697,26 @@ forecast_records = [
     page
     for page in forecast_records
     if page.get("id")
-    in logged_user_forecast_page_ids
+    in visible_forecast_page_ids
 ]
+
+
+if is_manager and not logged_user_branch:
+
+    st.warning(
+        "Your Manager account does not have a Branch assigned. "
+        "Designer filtering by Branch is unavailable."
+    )
+
+elif (
+    is_manager
+    and not NOTION_USERS_DATA_SOURCE_ID
+):
+
+    st.warning(
+        "Users data source is not configured. "
+        "Add NOTION_USERS_DATA_SOURCE_ID to Streamlit Secrets."
+    )
 
 
 # =========================================================
@@ -1468,9 +1784,19 @@ projects = sorted(
 # FILTER BAR
 # =========================================================
 
-st.caption(
-    f"Showing only Projects assigned to {logged_user_name} as Designer."
-)
+if is_manager:
+
+    st.caption(
+        "Manager view: select one Designer or All Designers "
+        f"in Branch {logged_user_branch or '—'}."
+    )
+
+else:
+
+    st.caption(
+        f"Showing only Projects assigned to "
+        f"{logged_user_name} as Designer."
+    )
 
 col1, col2, col3, col4 = (
     st.columns(
@@ -1486,13 +1812,28 @@ col1, col2, col3, col4 = (
 
 with col1:
 
-    selected_designer = (
-        st.selectbox(
-            "Designer",
-            [logged_user_name],
-            disabled=True,
+    if is_manager:
+
+        selected_designer = (
+            st.selectbox(
+                "Designer",
+                [
+                    "All"
+                ]
+                + manager_designer_names,
+                index=0,
+            )
         )
-    )
+
+    else:
+
+        selected_designer = (
+            st.selectbox(
+                "Designer",
+                [logged_user_name],
+                disabled=True,
+            )
+        )
 
 
 with col2:
@@ -1551,10 +1892,14 @@ for event in events:
     if (
         selected_designer
         != "All"
-        and props[
-            "designer"
-        ]
-        != selected_designer
+        and normalize_text(
+            props[
+                "designer"
+            ]
+        )
+        != normalize_text(
+            selected_designer
+        )
     ):
 
         continue
@@ -1618,10 +1963,23 @@ metric1, metric2, metric3 = (
 )
 
 
+filtered_event_ids = {
+    event.get("id")
+    for event in filtered_events
+    if event.get("id")
+}
+
+filtered_forecast_records = [
+    page
+    for page in forecast_records
+    if page.get("id")
+    in filtered_event_ids
+]
+
 metric1.metric(
     "Forecast Records",
     len(
-        forecast_records
+        filtered_forecast_records
     )
 )
 
@@ -1913,7 +2271,7 @@ three_months_from_today = (
 boots_events = []
 
 
-for event in events:
+for event in filtered_events:
 
     properties = event[
         "extendedProps"

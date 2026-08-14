@@ -9,3 +9,5 @@ resend
 msal
 folium
 streamlit-folium
+streamlit-cookies-controller
+supabase

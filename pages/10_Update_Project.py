@@ -46,6 +46,22 @@ logged_user_role = (
     )
 )
 
+logged_user_branch = (
+    st.session_state.get(
+        "user_branch",
+        "",
+    )
+    or ""
+).strip()
+
+logged_user_email = (
+    st.session_state.get(
+        "user_email",
+        "",
+    )
+    or ""
+).strip()
+
 
 if not logged_user_name:
 
@@ -78,6 +94,18 @@ NOTION_TOKEN = (
     st.secrets[
         "NOTION_TOKEN"
     ]
+)
+
+USERS_DATA_SOURCE_ID = (
+    st.secrets.get(
+        "NOTION_USERS_DATA_SOURCE_ID"
+    )
+    or st.secrets.get(
+        "USERS_DATA_SOURCE_ID"
+    )
+    or st.secrets.get(
+        "NOTION_USERS_DATABASE_ID"
+    )
 )
 
 PROJECTS_DATA_SOURCE_ID = (
@@ -239,6 +267,16 @@ def normalize_text(value):
         )
         .strip()
         .casefold()
+    )
+
+
+def is_manager_user():
+
+    return (
+        normalize_text(
+            logged_user_role
+        )
+        == "manager"
     )
 
 
@@ -1011,6 +1049,214 @@ def get_property_type(
 
 
 # =========================================================
+# USERS / BRANCH DESIGNERS
+# =========================================================
+
+@st.cache_data(
+    ttl=300,
+    show_spinner=False,
+)
+def load_users():
+
+    if not USERS_DATA_SOURCE_ID:
+        return []
+
+    users_query_url = (
+        "https://api.notion.com/v1/data_sources/"
+        f"{USERS_DATA_SOURCE_ID}/query"
+    )
+
+    records = []
+
+    payload = {
+        "page_size":
+            100,
+    }
+
+    next_cursor = None
+
+    while True:
+
+        current_payload = (
+            payload.copy()
+        )
+
+        if next_cursor:
+
+            current_payload[
+                "start_cursor"
+            ] = next_cursor
+
+        try:
+
+            response = requests.post(
+                users_query_url,
+                headers=HEADERS,
+                json=current_payload,
+                timeout=30,
+            )
+
+        except requests.RequestException:
+
+            return []
+
+        if response.status_code != 200:
+
+            return []
+
+        data = response.json()
+
+        records.extend(
+            data.get(
+                "results",
+                [],
+            )
+        )
+
+        if not data.get(
+            "has_more"
+        ):
+            break
+
+        next_cursor = data.get(
+            "next_cursor"
+        )
+
+        if not next_cursor:
+            break
+
+    return records
+
+
+def get_branch_designer_names(
+    branch_name,
+):
+
+    if not branch_name:
+        return []
+
+    target_branch = (
+        normalize_text(
+            branch_name
+        )
+    )
+
+    designer_names = []
+
+    for user in load_users():
+
+        properties = (
+            user.get(
+                "properties",
+                {},
+            )
+        )
+
+        branch = (
+            get_property_plain_text(
+                properties.get(
+                    "Branch",
+                    {},
+                )
+            )
+        )
+
+        if (
+            normalize_text(
+                branch
+            )
+            != target_branch
+        ):
+            continue
+
+        active_property = (
+            properties.get(
+                "Active",
+                {},
+            )
+        )
+
+        if (
+            active_property
+            and active_property.get(
+                "type"
+            )
+            == "checkbox"
+            and not bool(
+                active_property.get(
+                    "checkbox",
+                    False,
+                )
+            )
+        ):
+            continue
+
+        role = (
+            get_property_plain_text(
+                properties.get(
+                    "Role",
+                    {},
+                )
+            )
+        )
+
+        # Only Designer users should be included.
+        if (
+            role
+            and normalize_text(
+                role
+            )
+            != "designer"
+        ):
+            continue
+
+        name = (
+            get_property_plain_text(
+                properties.get(
+                    "Name",
+                    {},
+                )
+            )
+        )
+
+        if not name:
+
+            # Fallback to first title property.
+            for prop in (
+                properties.values()
+            ):
+
+                if (
+                    prop.get(
+                        "type"
+                    )
+                    == "title"
+                ):
+
+                    name = (
+                        get_property_plain_text(
+                            prop
+                        )
+                    )
+
+                    if name:
+                        break
+
+        if name:
+
+            designer_names.append(
+                name.strip()
+            )
+
+    return sorted(
+        set(
+            designer_names
+        ),
+        key=str.casefold,
+    )
+
+
+# =========================================================
 # LOAD PROJECTS
 # =========================================================
 
@@ -1021,39 +1267,74 @@ def get_property_type(
 def load_projects(
     user_name,
     user_role,
+    user_branch,
 ):
 
-    # =====================================================
-    # ONLY PROJECTS ASSIGNED TO THE LOGGED-IN USER
-    # =====================================================
-    #
-    # This filter applies to every role, including Manager.
-    # The first Project selector therefore always shows only
-    # projects whose Designer matches the active user.
-    # =====================================================
+    manager_mode = (
+        normalize_text(
+            user_role
+        )
+        == "manager"
+    )
 
-    payload = {
-        "page_size":
-            100,
+    # -----------------------------------------------------
+    # DESIGNER
+    # -----------------------------------------------------
+    # Designers continue to see only their own Projects.
+    # -----------------------------------------------------
 
-        "filter": {
+    if not manager_mode:
 
-            "property":
-                "Designer",
+        payload = {
+            "page_size":
+                100,
 
-            "select": {
+            "filter": {
 
-                "equals":
-                    user_name,
+                "property":
+                    "Designer",
+
+                "select": {
+
+                    "equals":
+                        user_name,
+                }
             }
         }
-    }
 
+        allowed_designers = None
+
+    # -----------------------------------------------------
+    # MANAGER
+    # -----------------------------------------------------
+    # Managers load Projects and then keep only Projects
+    # assigned to Designers in the Manager's Branch.
+    # -----------------------------------------------------
+
+    else:
+
+        payload = {
+            "page_size":
+                100,
+        }
+
+        branch_designers = (
+            get_branch_designer_names(
+                user_branch
+            )
+        )
+
+        allowed_designers = {
+            normalize_text(
+                designer_name
+            )
+            for designer_name
+            in branch_designers
+        }
 
     projects = []
 
     next_cursor = None
-
 
     while True:
 
@@ -1061,13 +1342,11 @@ def load_projects(
             payload.copy()
         )
 
-
         if next_cursor:
 
             current_payload[
                 "start_cursor"
             ] = next_cursor
-
 
         response = requests.post(
             PROJECTS_QUERY_URL,
@@ -1076,7 +1355,6 @@ def load_projects(
             timeout=30,
         )
 
-
         if response.status_code != 200:
 
             safe_request_error(
@@ -1084,34 +1362,65 @@ def load_projects(
                 "Unable to retrieve Projects.",
             )
 
-
         data = (
             response.json()
         )
 
-
-        projects.extend(
+        current_projects = (
             data.get(
                 "results",
                 [],
             )
         )
 
+        if manager_mode:
+
+            for project in (
+                current_projects
+            ):
+
+                properties = (
+                    project.get(
+                        "properties",
+                        {},
+                    )
+                )
+
+                project_designer = (
+                    get_select(
+                        properties,
+                        "Designer",
+                    )
+                )
+
+                if (
+                    normalize_text(
+                        project_designer
+                    )
+                    in allowed_designers
+                ):
+
+                    projects.append(
+                        project
+                    )
+
+        else:
+
+            projects.extend(
+                current_projects
+            )
 
         if not data.get(
             "has_more"
         ):
             break
 
-
         next_cursor = data.get(
             "next_cursor"
         )
 
-
         if not next_cursor:
             break
-
 
     return projects
 
@@ -1486,6 +1795,7 @@ try:
         load_projects(
             logged_user_name,
             logged_user_role,
+            logged_user_branch,
         )
     )
 
@@ -1510,10 +1820,35 @@ except Exception as error:
 
 if not projects:
 
-    st.info(
-        "No projects are available "
-        "for the current user."
-    )
+    if is_manager_user():
+
+        if not logged_user_branch:
+
+            st.warning(
+                "Your Manager account does not have "
+                "a Branch assigned."
+            )
+
+        elif not USERS_DATA_SOURCE_ID:
+
+            st.warning(
+                "Users data source is not configured. "
+                "Verify NOTION_USERS_DATA_SOURCE_ID."
+            )
+
+        else:
+
+            st.info(
+                "No Projects were found for Designers "
+                f"in Branch {logged_user_branch}."
+            )
+
+    else:
+
+        st.info(
+            "No projects are available "
+            "for the current user."
+        )
 
     st.stop()
 
@@ -1553,9 +1888,18 @@ for project in projects:
     )
 
 
-    label = (
-        f"{number} - {name}"
-    )
+    if is_manager_user():
+
+        label = (
+            f"{number} - {name} "
+            f"| {designer_name}"
+        )
+
+    else:
+
+        label = (
+            f"{number} - {name}"
+        )
 
 
     project_lookup[
@@ -1796,13 +2140,12 @@ col1, col2 = (
 
 with col1:
 
-    if (
-        logged_user_role
-        == "Manager"
-    ):
+    if is_manager_user():
 
         available_designers = (
-            designer_options.copy()
+            get_branch_designer_names(
+                logged_user_branch
+            )
         )
 
 

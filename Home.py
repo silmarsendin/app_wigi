@@ -3,10 +3,16 @@ import requests
 import bcrypt
 import secrets
 import hashlib
+import hmac
+import base64
+import json
 import resend
+
+from supabase import create_client
 
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
+from streamlit_cookies_controller import CookieController
 from utils.layout import show_sidebar_branding
 
 
@@ -26,10 +32,6 @@ st.set_page_config(
 # =========================================================
 
 NOTION_TOKEN = st.secrets["NOTION_TOKEN"]
-
-NOTION_USERS_DATA_SOURCE_ID = (
-    st.secrets["NOTION_USERS_DATA_SOURCE_ID"]
-)
 
 # Forecast data source.
 # The code accepts either of the secret names below so the Home page
@@ -53,7 +55,98 @@ RESEND_API_KEY = st.secrets["RESEND_API_KEY"]
 
 RESET_EMAIL_SENDER = st.secrets["RESET_EMAIL_SENDER"]
 
+# Secret used only to sign persistent login tokens.
+# Add AUTH_SECRET to .streamlit/secrets.toml and Streamlit Cloud secrets.
+AUTH_SECRET = st.secrets["AUTH_SECRET"]
+
+# =========================================================
+# SUPABASE / AUTH / PROFILES
+# =========================================================
+# Authentication is handled by Supabase Auth.
+# public.profiles stores only application user data:
+# id, created_at, name, email, employee_number, role,
+# branch and active.
+#
+# Projects and Forecast remain in Notion.
+SUPABASE_URL = (
+    st.secrets.get("SUPABASE_URL", "")
+    or ""
+).strip().rstrip("/")
+
+SUPABASE_SECRET_KEY = (
+    st.secrets.get("SUPABASE_SECRET_KEY", "")
+    or st.secrets.get("SUPABASE_SERVICE_ROLE_KEY", "")
+    or st.secrets.get("SUPABASE_KEY", "")
+    or ""
+).strip()
+
+# A publishable/anon key is optional in this server-side
+# Streamlit implementation. If it does not exist, the secret
+# key is also used for the password sign-in request.
+SUPABASE_PUBLIC_KEY = (
+    st.secrets.get("SUPABASE_PUBLISHABLE_KEY", "")
+    or st.secrets.get("SUPABASE_ANON_KEY", "")
+    or ""
+).strip()
+
+PROFILES_TABLE_NAME = "profiles"
+
+# =========================================================
+# FIXED BRANCH OPTIONS
+# =========================================================
+# Branches are part of the company structure and therefore
+# should not depend on which users already exist in profiles.
+BRANCH_OPTIONS = [
+    "ATLANTA",
+    "CHARLOTTE",
+    "FORT MYERS",
+    "GAINESVILLE",
+    "JACKSONVILLE",
+    "MELBOURNE",
+    "MIAMI",
+    "ORLANDO",
+    "PENSACOLA",
+    "TAMPA",
+    "WEST PALM BEACH",
+]
+
+
+def create_supabase_admin_client():
+
+    if (
+        not SUPABASE_URL
+        or not SUPABASE_SECRET_KEY
+    ):
+        raise RuntimeError(
+            "Supabase is not configured. "
+            "Check SUPABASE_URL and SUPABASE_SECRET_KEY."
+        )
+
+    # Use the standard client initialization for compatibility
+    # across supabase-py versions. Admin Auth operations are
+    # available because this client uses the server-side secret key.
+    return create_client(
+        SUPABASE_URL,
+        SUPABASE_SECRET_KEY,
+    )
+
+
+supabase_admin = (
+    create_supabase_admin_client()
+)
+
+# Persistent login settings.
+# The login remains valid for up to 10 hours, but never past midnight
+# in the app's local timezone.
+AUTH_COOKIE_NAME = "wiginton_auth"
+AUTH_DURATION_HOURS = 10
+AUTH_COOKIE_SECURE = APP_URL.lower().startswith("https://")
+
 resend.api_key = RESEND_API_KEY
+
+# Browser cookie controller used to restore the user after a new
+# Streamlit session is created in the same browser/profile.
+cookie_controller = CookieController(key="wiginton_auth_cookies")
 
 
 NOTION_HEADERS = {
@@ -91,8 +184,22 @@ if "user_role" not in st.session_state:
 if "user_branch" not in st.session_state:
     st.session_state.user_branch = None
 
+if "user_employee_number" not in st.session_state:
+    st.session_state.user_employee_number = None
+
 if "login_view" not in st.session_state:
     st.session_state.login_view = "login"
+
+
+if "login_error_detail" not in st.session_state:
+    st.session_state.login_error_detail = None
+
+
+if "password_reset_detail" not in st.session_state:
+    st.session_state.password_reset_detail = None
+
+if "supabase_profile_error" not in st.session_state:
+    st.session_state.supabase_profile_error = None
 
 
 # =========================================================
@@ -197,6 +304,585 @@ def get_select(
         default
     )
 
+
+
+
+# =========================================================
+# SUPABASE PROFILE HELPERS
+# =========================================================
+
+def normalize_profile(
+    row
+):
+
+    if not row:
+        return None
+
+    return {
+        "id":
+            row.get(
+                "id"
+            ),
+
+        "created_at":
+            row.get(
+                "created_at"
+            ),
+
+        "name":
+            (
+                row.get(
+                    "name"
+                )
+                or ""
+            ).strip(),
+
+        "email":
+            (
+                row.get(
+                    "email"
+                )
+                or ""
+            )
+            .strip()
+            .lower(),
+
+        "employee_number":
+            (
+                row.get(
+                    "employee_number"
+                )
+                or ""
+            ).strip(),
+
+        "role":
+            (
+                row.get(
+                    "role"
+                )
+                or "Designer"
+            ).strip(),
+
+        "branch":
+            (
+                row.get(
+                    "branch"
+                )
+                or ""
+            ).strip(),
+
+        "active":
+            bool(
+                row.get(
+                    "active",
+                    True
+                )
+            ),
+    }
+
+
+def load_profiles():
+
+    try:
+
+        response = (
+            supabase_admin
+            .table(
+                PROFILES_TABLE_NAME
+            )
+            .select(
+                "id,created_at,name,email,"
+                "employee_number,role,branch,active"
+            )
+            .order(
+                "name"
+            )
+            .execute()
+        )
+
+    except Exception:
+
+        return []
+
+    return [
+        normalize_profile(
+            row
+        )
+        for row in (
+            response.data
+            or []
+        )
+    ]
+
+
+def get_profile_by_email(
+    email
+):
+
+    target_email = (
+        email
+        or ""
+    ).strip().lower()
+
+    if not target_email:
+        return None
+
+    st.session_state[
+        "supabase_profile_error"
+    ] = None
+
+    try:
+
+        response = (
+            supabase_admin
+            .table(
+                PROFILES_TABLE_NAME
+            )
+            .select(
+                "id,created_at,name,email,"
+                "employee_number,role,branch,active"
+            )
+            .execute()
+        )
+
+    except Exception as error:
+
+        st.session_state[
+            "supabase_profile_error"
+        ] = str(
+            error
+        )
+
+        return None
+
+    for row in (
+        response.data
+        or []
+    ):
+
+        profile = (
+            normalize_profile(
+                row
+            )
+        )
+
+        if (
+            profile
+            and profile.get(
+                "email",
+                ""
+            )
+            .strip()
+            .lower()
+            == target_email
+        ):
+
+            return profile
+
+    return None
+
+
+
+def get_profile_by_id(
+    profile_id
+):
+
+    if not profile_id:
+        return None
+
+    try:
+
+        response = (
+            supabase_admin
+            .table(
+                PROFILES_TABLE_NAME
+            )
+            .select(
+                "id,created_at,name,email,"
+                "employee_number,role,branch,active"
+            )
+            .eq(
+                "id",
+                str(
+                    profile_id
+                )
+            )
+            .limit(
+                1
+            )
+            .execute()
+        )
+
+    except Exception:
+
+        return None
+
+    rows = (
+        response.data
+        or []
+    )
+
+    if not rows:
+        return None
+
+    return normalize_profile(
+        rows[0]
+    )
+
+
+def update_profile(
+    profile_id,
+    values
+):
+
+    if not profile_id:
+        return False
+
+    allowed_fields = {
+        "name",
+        "email",
+        "employee_number",
+        "role",
+        "branch",
+        "active",
+    }
+
+    payload = {
+        key: value
+        for key, value
+        in values.items()
+        if key in allowed_fields
+    }
+
+    if not payload:
+        return True
+
+    try:
+
+        (
+            supabase_admin
+            .table(
+                PROFILES_TABLE_NAME
+            )
+            .update(
+                payload
+            )
+            .eq(
+                "id",
+                str(
+                    profile_id
+                )
+            )
+            .execute()
+        )
+
+        return True
+
+    except Exception:
+
+        return False
+
+
+def insert_profile(
+    user_id,
+    name,
+    email,
+    employee_number,
+    role,
+    branch,
+    active=True
+):
+
+    payload = {
+        "id":
+            str(
+                user_id
+            ),
+
+        "name":
+            name.strip(),
+
+        "email":
+            email.strip().lower(),
+
+        "employee_number":
+            employee_number.strip(),
+
+        "role":
+            role.strip()
+            or "Designer",
+
+        "branch":
+            branch.strip(),
+
+        "active":
+            bool(
+                active
+            ),
+    }
+
+    try:
+
+        (
+            supabase_admin
+            .table(
+                PROFILES_TABLE_NAME
+            )
+            .insert(
+                payload
+            )
+            .execute()
+        )
+
+        return True, None
+
+    except Exception as error:
+
+        return (
+            False,
+            str(
+                error
+            ),
+        )
+
+
+def authenticate_with_supabase_auth(
+    email,
+    password
+):
+    """
+    Authenticate an end user with Supabase Auth.
+
+    IMPORTANT:
+    User sign-in must use the Publishable/anon key.
+    The Secret key is reserved for server-side admin operations.
+    """
+
+    if not SUPABASE_URL:
+        return {
+            "error":
+                "SUPABASE_URL is not configured."
+        }
+
+    if not SUPABASE_PUBLIC_KEY:
+        return {
+            "error":
+                (
+                    "SUPABASE_PUBLISHABLE_KEY is not configured. "
+                    "Add the Supabase Publishable Key to "
+                    ".streamlit/secrets.toml."
+                )
+        }
+
+    try:
+
+        response = requests.post(
+            (
+                f"{SUPABASE_URL}/auth/v1/token"
+                "?grant_type=password"
+            ),
+            headers={
+                "apikey":
+                    SUPABASE_PUBLIC_KEY,
+
+                "Content-Type":
+                    "application/json",
+            },
+            json={
+                "email":
+                    email.strip().lower(),
+
+                "password":
+                    password,
+            },
+            timeout=20,
+        )
+
+    except requests.RequestException as error:
+
+        return {
+            "error":
+                (
+                    "Unable to connect to Supabase Auth. "
+                    f"{error}"
+                )
+        }
+
+    if response.status_code != 200:
+
+        try:
+            response_data = (
+                response.json()
+            )
+
+            error_message = (
+                response_data.get(
+                    "msg"
+                )
+                or response_data.get(
+                    "message"
+                )
+                or response_data.get(
+                    "error_description"
+                )
+                or response_data.get(
+                    "error"
+                )
+                or "Authentication failed."
+            )
+
+        except Exception:
+
+            error_message = (
+                "Authentication failed."
+            )
+
+        return {
+            "error":
+                error_message,
+
+            "status_code":
+                response.status_code,
+        }
+
+    data = response.json()
+
+    auth_user = (
+        data.get(
+            "user"
+        )
+        or {}
+    )
+
+    user_id = (
+        auth_user.get(
+            "id"
+        )
+    )
+
+    if not user_id:
+
+        return {
+            "error":
+                (
+                    "Supabase authenticated the request, "
+                    "but no User ID was returned."
+                )
+        }
+
+    return {
+        "id":
+            user_id,
+
+        "email":
+            (
+                auth_user.get(
+                    "email"
+                )
+                or email
+            )
+            .strip()
+            .lower(),
+
+        "access_token":
+            data.get(
+                "access_token"
+            ),
+
+        "refresh_token":
+            data.get(
+                "refresh_token"
+            ),
+
+        "error":
+            None,
+    }
+
+
+
+def create_auth_user(
+    email,
+    password,
+    name
+):
+
+    try:
+
+        response = (
+            supabase_admin
+            .auth
+            .admin
+            .create_user(
+                {
+                    "email":
+                        email.strip().lower(),
+
+                    "password":
+                        password,
+
+                    "email_confirm":
+                        True,
+
+                    "user_metadata": {
+                        "name":
+                            name.strip(),
+                    },
+                }
+            )
+        )
+
+    except Exception as error:
+
+        return (
+            None,
+            str(
+                error
+            ),
+        )
+
+    auth_user = (
+        getattr(
+            response,
+            "user",
+            None
+        )
+    )
+
+    if not auth_user:
+        return (
+            None,
+            "Unable to create the authentication user."
+        )
+
+    return (
+        auth_user,
+        None,
+    )
+
+
+def delete_auth_user(
+    user_id
+):
+
+    if not user_id:
+        return
+
+    try:
+
+        (
+            supabase_admin
+            .auth
+            .admin
+            .delete_user(
+                str(
+                    user_id
+                )
+            )
+        )
+
+    except Exception:
+
+        pass
 
 
 # =========================================================
@@ -517,9 +1203,7 @@ def normalize_identity(
 
 def get_all_users():
 
-    return query_data_source(
-        NOTION_USERS_DATA_SOURCE_ID
-    )
+    return load_profiles()
 
 
 def get_users_in_branch(
@@ -529,61 +1213,82 @@ def get_users_in_branch(
     if not branch_name:
         return []
 
-    pages = get_all_users()
-
-    target_branch = normalize_text(
-        branch_name
+    target_branch = (
+        normalize_text(
+            branch_name
+        )
     )
 
     users = []
 
-    for page in pages:
+    for profile in load_profiles():
 
-        properties = page.get(
-            "properties",
-            {}
-        )
+        if not profile.get(
+            "active",
+            True
+        ):
+            continue
 
-        user_branch = normalize_text(
-            get_select(
-                properties,
-                "Branch",
-                ""
+        if (
+            normalize_text(
+                profile.get(
+                    "branch",
+                    ""
+                )
             )
-        )
-
-        if user_branch != target_branch:
+            != target_branch
+        ):
             continue
 
         user_name = (
-            get_title(
-                properties,
-                "Name"
+            profile.get(
+                "name",
+                ""
             )
             or ""
         ).strip()
 
         user_email = (
-            get_email(
-                properties,
-                "Email"
+            profile.get(
+                "email",
+                ""
+            )
+            or ""
+        ).strip()
+
+        employee_number = (
+            profile.get(
+                "employee_number",
+                ""
             )
             or ""
         ).strip()
 
         identifiers = set()
 
-        # Name
-        if user_name:
+        for value in [
+            user_name,
+            user_email,
+            employee_number,
+        ]:
 
-            identifiers.add(
+            normalized_value = (
                 normalize_identity(
-                    user_name
+                    value
                 )
             )
 
-            # Also accept individual name parts.
-            for part in user_name.split():
+            if normalized_value:
+
+                identifiers.add(
+                    normalized_value
+                )
+
+        if user_name:
+
+            for part in (
+                user_name.split()
+            ):
 
                 normalized_part = (
                     normalize_identity(
@@ -591,20 +1296,18 @@ def get_users_in_branch(
                     )
                 )
 
-                if len(normalized_part) >= 3:
+                if (
+                    len(
+                        normalized_part
+                    )
+                    >= 3
+                ):
 
                     identifiers.add(
                         normalized_part
                     )
 
-        # Email and email prefix
         if user_email:
-
-            identifiers.add(
-                normalize_identity(
-                    user_email
-                )
-            )
 
             email_prefix = (
                 user_email
@@ -620,47 +1323,10 @@ def get_users_in_branch(
                 )
             )
 
-        # Include all simple text/select values in Users.
-        # This supports cases where Projects.Designer uses
-        # initials, display names, short names, etc.
-        for prop in properties.values():
-
-            prop_type = prop.get(
-                "type"
-            )
-
-            if prop_type not in {
-                "title",
-                "rich_text",
-                "select",
-                "status",
-                "email",
-                "number",
-            }:
-                continue
-
-            value = (
-                get_property_plain_text(
-                    prop
-                )
-            )
-
-            normalized_value = (
-                normalize_identity(
-                    value
-                )
-            )
-
-            if normalized_value:
-
-                identifiers.add(
-                    normalized_value
-                )
-
         users.append(
             {
                 "id":
-                    page.get(
+                    profile.get(
                         "id"
                     )
                     or "",
@@ -670,6 +1336,21 @@ def get_users_in_branch(
 
                 "email":
                     user_email,
+
+                "employee_number":
+                    employee_number,
+
+                "role":
+                    profile.get(
+                        "role",
+                        "Designer"
+                    ),
+
+                "branch":
+                    profile.get(
+                        "branch",
+                        ""
+                    ),
 
                 "identifiers":
                     identifiers,
@@ -681,34 +1362,38 @@ def get_users_in_branch(
 
 def get_logged_manager_branch():
 
-    user_email = (
-        st.session_state.user_email
+    branch = (
+        st.session_state.user_branch
         or ""
-    ).strip().lower()
+    ).strip()
 
-    if not user_email:
-        return ""
+    if branch:
+        return branch
 
-    user_page = get_user_by_email(
-        user_email
+    profile = get_profile_by_email(
+        (
+            st.session_state.user_email
+            or ""
+        )
     )
 
-    if not user_page:
+    if not profile:
         return ""
 
-    properties = user_page.get(
-        "properties",
-        {}
-    )
-
-    return (
-        get_select(
-            properties,
-            "Branch",
+    branch = (
+        profile.get(
+            "branch",
             ""
         )
         or ""
     ).strip()
+
+    st.session_state.user_branch = (
+        branch
+    )
+
+    return branch
+
 
 
 def identity_matches_user(
@@ -2481,100 +3166,60 @@ def render_active_project_progress():
 
 def get_user_branch_options():
 
-    url = (
-        "https://api.notion.com/v1/data_sources/"
-        f"{NOTION_USERS_DATA_SOURCE_ID}"
-    )
-
-    try:
-
-        response = requests.get(
-            url,
-            headers=NOTION_HEADERS,
-            timeout=15
-        )
-
-    except requests.RequestException:
-
-        return []
-
-    if response.status_code != 200:
-
-        return []
-
-    properties = (
-        response.json()
-        .get(
-            "properties",
-            {}
-        )
-    )
-
-    branch_property = properties.get(
-        "Branch",
-        {}
-    )
-
-    if (
-        branch_property.get(
-            "type"
-        )
-        != "select"
-    ):
-
-        return []
-
-    options = (
-        branch_property
-        .get(
-            "select",
-            {}
-        )
-        .get(
-            "options",
-            []
-        )
-    )
-
-    return [
-        option.get(
-            "name",
-            ""
-        )
-        for option in options
-        if option.get(
-            "name"
-        )
-    ]
+    return BRANCH_OPTIONS.copy()
 
 
 # =========================================================
 # GET USER BY EMAIL
 # =========================================================
 
-def get_user_by_email(email):
+def get_user_by_email(
+    email
+):
 
-    url = (
-        "https://api.notion.com/v1/data_sources/"
-        f"{NOTION_USERS_DATA_SOURCE_ID}/query"
+    return get_profile_by_email(
+        email
     )
 
-    payload = {
-        "filter": {
-            "property": "Email",
-            "email": {
-                "equals": email
-            }
-        }
-    }
+
+# =========================================================
+# SUPABASE AUTH USER LOOKUP
+# =========================================================
+
+def get_auth_user_by_email(
+    email
+):
+
+    target_email = (
+        email
+        or ""
+    ).strip().lower()
+
+    if not target_email:
+        return None
 
     try:
 
-        response = requests.post(
-            url,
-            headers=NOTION_HEADERS,
-            json=payload,
-            timeout=15
+        response = requests.get(
+            (
+                f"{SUPABASE_URL}"
+                "/auth/v1/admin/users"
+            ),
+            headers={
+                "apikey":
+                    SUPABASE_SECRET_KEY,
+
+                "Authorization":
+                    (
+                        "Bearer "
+                        f"{SUPABASE_SECRET_KEY}"
+                    ),
+            },
+            params={
+                "page": 1,
+                "per_page": 1000,
+            },
+            timeout=20,
         )
 
     except requests.RequestException:
@@ -2582,161 +3227,332 @@ def get_user_by_email(email):
         return None
 
     if response.status_code != 200:
-
         return None
 
-    results = response.json().get(
-        "results",
-        []
+    data = response.json()
+
+    users = (
+        data.get(
+            "users",
+            []
+        )
+        if isinstance(
+            data,
+            dict
+        )
+        else []
     )
 
-    if not results:
+    for user in users:
 
-        return None
+        user_email = (
+            user.get(
+                "email",
+                ""
+            )
+            or ""
+        ).strip().lower()
 
-    return results[0]
+        if user_email == target_email:
+            return user
+
+    return None
 
 
-# =========================================================
-# UPDATE USER IN NOTION
-# =========================================================
-
-def update_user_properties(
-    page_id,
-    properties
+def update_existing_auth_user_for_account(
+    user_id,
+    email,
+    password,
+    name
 ):
 
-    url = (
-        "https://api.notion.com/v1/pages/"
-        f"{page_id}"
-    )
+    if not user_id:
+        return False, "Authentication User ID was not found."
 
     try:
 
-        response = requests.patch(
-            url,
-            headers=NOTION_HEADERS,
-            json={
-                "properties": properties
+        response = requests.put(
+            (
+                f"{SUPABASE_URL}"
+                "/auth/v1/admin/users/"
+                f"{user_id}"
+            ),
+            headers={
+                "apikey":
+                    SUPABASE_SECRET_KEY,
+
+                "Authorization":
+                    (
+                        "Bearer "
+                        f"{SUPABASE_SECRET_KEY}"
+                    ),
+
+                "Content-Type":
+                    "application/json",
             },
-            timeout=15
+            json={
+                "email":
+                    email.strip().lower(),
+
+                "password":
+                    password,
+
+                "email_confirm":
+                    True,
+
+                "user_metadata": {
+                    "name":
+                        name.strip(),
+                },
+            },
+            timeout=20,
         )
 
-    except requests.RequestException:
+    except requests.RequestException as error:
 
-        return False
+        return (
+            False,
+            str(
+                error
+            ),
+        )
 
-    return response.status_code == 200
+    if response.status_code not in {
+        200,
+        201,
+    }:
+
+        try:
+
+            detail = (
+                response.json()
+            )
+
+        except Exception:
+
+            detail = (
+                response.text
+            )
+
+        return (
+            False,
+            str(
+                detail
+            ),
+        )
+
+    return True, None
 
 
 # =========================================================
-# CREATE USER IN NOTION
+# CREATE USER
 # =========================================================
 
 def create_user_in_notion(
     name,
     email,
+    employee_number,
     password,
     branch
 ):
+    """
+    Create/complete a Wiginton Tools account using:
+      1. Supabase Authentication
+      2. public.profiles
 
-    existing_user = get_user_by_email(
+    If an Authentication user already exists but no profile
+    exists yet, the account is completed instead of rejected.
+    """
+
+    email = (
         email
+        .strip()
+        .lower()
     )
 
-    if existing_user:
+    # -----------------------------------------------------
+    # 1. PROFILE ALREADY EXISTS
+    # -----------------------------------------------------
 
-        return (
-            False,
-            "An account already exists for this email."
+    existing_profile = (
+        get_profile_by_email(
+            email
         )
-
-    password_hash = bcrypt.hashpw(
-        password.encode("utf-8"),
-        bcrypt.gensalt()
-    ).decode("utf-8")
-
-    url = (
-        "https://api.notion.com/v1/pages"
     )
 
-    payload = {
-
-        "parent": {
-            "type": "data_source_id",
-            "data_source_id":
-                NOTION_USERS_DATA_SOURCE_ID
-        },
-
-        "properties": {
-
-            "Name": {
-                "title": [
-                    {
-                        "text": {
-                            "content": name
-                        }
-                    }
-                ]
-            },
-
-            "Email": {
-                "email": email
-            },
-
-            "Password Hash": {
-                "rich_text": [
-                    {
-                        "text": {
-                            "content":
-                                password_hash
-                        }
-                    }
-                ]
-            },
-
-            "Active": {
-                "checkbox": True
-            },
-
-            "Role": {
-                "select": {
-                    "name": "Designer"
-                }
-            },
-
-            "Branch": {
-                "select": {
-                    "name": branch
-                }
-            }
-        }
-    }
-
-    try:
-
-        response = requests.post(
-            url,
-            headers=NOTION_HEADERS,
-            json=payload,
-            timeout=15
-        )
-
-    except requests.RequestException:
+    if existing_profile:
 
         return (
             False,
-            "Unable to connect to the user database."
+            (
+                "An account already exists for this email "
+                "in the current Supabase profiles table."
+            )
         )
 
-    if response.status_code not in [
-        200,
-        201
-    ]:
+    # -----------------------------------------------------
+    # 2. CHECK SUPABASE AUTH
+    # -----------------------------------------------------
+
+    existing_auth_user = (
+        get_auth_user_by_email(
+            email
+        )
+    )
+
+    if existing_auth_user:
+
+        user_id = (
+            existing_auth_user.get(
+                "id"
+            )
+        )
+
+        # The Auth user exists but profiles does not.
+        # Complete/migrate the account and set the password
+        # entered in the Create Account screen.
+        auth_updated, auth_error = (
+            update_existing_auth_user_for_account(
+                user_id=
+                    user_id,
+
+                email=
+                    email,
+
+                password=
+                    password,
+
+                name=
+                    name,
+            )
+        )
+
+        if not auth_updated:
+
+            return (
+                False,
+                (
+                    "The email already exists in Supabase "
+                    "Authentication, but the account could "
+                    "not be completed. "
+                    f"{auth_error or ''}"
+                ).strip()
+            )
+
+        success, profile_error = (
+            insert_profile(
+                user_id=
+                    user_id,
+
+                name=
+                    name,
+
+                email=
+                    email,
+
+                employee_number=
+                    employee_number,
+
+                role=
+                    "Designer",
+
+                branch=
+                    branch,
+
+                active=
+                    True,
+            )
+        )
+
+        if not success:
+
+            return (
+                False,
+                (
+                    "The Authentication user exists, but "
+                    "the profile could not be created. "
+                    f"{profile_error or ''}"
+                ).strip()
+            )
+
+        return (
+            True,
+            (
+                "Account completed successfully. "
+                "The existing Supabase Authentication user "
+                "has now been linked to a new profile."
+            )
+        )
+
+    # -----------------------------------------------------
+    # 3. CREATE BRAND-NEW AUTH USER
+    # -----------------------------------------------------
+
+    auth_user, auth_error = (
+        create_auth_user(
+            email,
+            password,
+            name
+        )
+    )
+
+    if not auth_user:
 
         return (
             False,
-            "Unable to create account."
+            auth_error
+            or "Unable to create account."
+        )
+
+    user_id = getattr(
+        auth_user,
+        "id",
+        None
+    )
+
+    # -----------------------------------------------------
+    # 4. CREATE PROFILE
+    # -----------------------------------------------------
+
+    success, profile_error = (
+        insert_profile(
+            user_id=
+                user_id,
+
+            name=
+                name,
+
+            email=
+                email,
+
+            employee_number=
+                employee_number,
+
+            role=
+                "Designer",
+
+            branch=
+                branch,
+
+            active=
+                True,
+        )
+    )
+
+    if not success:
+
+        # Roll back Auth creation when profile creation fails.
+        delete_auth_user(
+            user_id
+        )
+
+        return (
+            False,
+            (
+                "Authentication user was created, "
+                "but the profile could not be saved. "
+                f"{profile_error or ''}"
+            ).strip()
         )
 
     return (
@@ -2754,215 +3570,570 @@ def authenticate_user(
     password
 ):
 
-    user_page = get_user_by_email(
-        email
+    st.session_state[
+        "login_error_detail"
+    ] = None
+
+    auth_result = (
+        authenticate_with_supabase_auth(
+            email,
+            password
+        )
     )
 
-    if not user_page:
+    if not auth_result:
+
+        st.session_state[
+            "login_error_detail"
+        ] = (
+            "Supabase Auth returned no response."
+        )
 
         return None
 
-    properties = user_page.get(
-        "properties",
-        {}
+    if auth_result.get(
+        "error"
+    ):
+
+        st.session_state[
+            "login_error_detail"
+        ] = (
+            auth_result.get(
+                "error"
+            )
+        )
+
+        return None
+
+    user_id = (
+        auth_result.get(
+            "id"
+        )
     )
 
-    name = get_title(
-        properties,
-        "Name"
+    profile = get_profile_by_id(
+        user_id
     )
 
-    notion_email = get_email(
-        properties,
-        "Email"
-    )
+    if not profile:
 
-    password_hash = get_text(
-        properties,
-        "Password Hash"
-    )
+        profile_error = (
+            st.session_state.get(
+                "supabase_profile_error"
+            )
+        )
 
-    active = get_checkbox(
-        properties,
-        "Active",
+        if profile_error:
+
+            st.session_state[
+                "login_error_detail"
+            ] = (
+                "Authentication succeeded, but "
+                "public.profiles could not be read: "
+                f"{profile_error}"
+            )
+
+        else:
+
+            st.session_state[
+                "login_error_detail"
+            ] = (
+                "Authentication succeeded, but no matching "
+                "record was found in public.profiles."
+            )
+
+        return None
+
+    if not profile.get(
+        "active",
         True
-    )
+    ):
 
-    role = get_select(
-        properties,
-        "Role",
-        "Designer"
-    )
-
-    branch = get_select(
-        properties,
-        "Branch",
-        ""
-    )
-
-    if not active:
+        st.session_state[
+            "login_error_detail"
+        ] = (
+            "This user profile is inactive."
+        )
 
         return None
 
-    if not password_hash:
+    return {
+        "id":
+            profile.get(
+                "id"
+            ),
 
-        return None
+        "name":
+            profile.get(
+                "name",
+                ""
+            ),
 
+        "email":
+            profile.get(
+                "email",
+                auth_result.get(
+                    "email",
+                    ""
+                )
+            ),
+
+        "employee_number":
+            profile.get(
+                "employee_number",
+                ""
+            ),
+
+        "role":
+            profile.get(
+                "role",
+                "Designer"
+            ),
+
+        "branch":
+            profile.get(
+                "branch",
+                ""
+            ),
+    }
+
+
+
+# =========================================================
+# PASSWORD RESET TOKEN
+# =========================================================
+
+def generate_reset_token(
+    profile
+):
+
+    now_timestamp = int(
+        datetime.now(
+            timezone.utc
+        ).timestamp()
+    )
+
+    expiration_timestamp = int(
+        (
+            datetime.now(
+                timezone.utc
+            )
+            + timedelta(
+                minutes=30
+            )
+        ).timestamp()
+    )
+
+    nonce = (
+        secrets.token_urlsafe(
+            24
+        )
+    )
+
+    payload = {
+        "purpose":
+            "password_reset",
+
+        "id":
+            str(
+                profile.get(
+                    "id"
+                )
+            ),
+
+        "email":
+            profile.get(
+                "email",
+                ""
+            ),
+
+        "nonce":
+            nonce,
+
+        "iat":
+            now_timestamp,
+
+        "exp":
+            expiration_timestamp,
+    }
+
+    encoded_payload = (
+        base64.urlsafe_b64encode(
+            json.dumps(
+                payload,
+                separators=(
+                    ",",
+                    ":"
+                ),
+                sort_keys=True
+            )
+            .encode(
+                "utf-8"
+            )
+        )
+        .decode(
+            "utf-8"
+        )
+        .rstrip(
+            "="
+        )
+    )
+
+    signature = hmac.new(
+        AUTH_SECRET.encode(
+            "utf-8"
+        ),
+        encoded_payload.encode(
+            "utf-8"
+        ),
+        hashlib.sha256
+    ).hexdigest()
+
+    # Store the reset nonce in Supabase Auth metadata so the
+    # reset link becomes one-time-use without adding columns
+    # to public.profiles.
     try:
 
-        password_ok = bcrypt.checkpw(
-            password.encode("utf-8"),
-            password_hash.encode("utf-8")
+        (
+            supabase_admin
+            .auth
+            .admin
+            .update_user_by_id(
+                str(
+                    profile[
+                        "id"
+                    ]
+                ),
+                {
+                    "user_metadata": {
+                        "password_reset_nonce":
+                            nonce,
+                    }
+                }
+            )
         )
 
     except Exception:
 
         return None
 
-    if not password_ok:
+    return (
+        f"{encoded_payload}."
+        f"{signature}"
+    )
 
+
+def decode_reset_token(
+    token
+):
+
+    if not token:
         return None
-
-    return {
-        "id": user_page.get("id"),
-        "name": name,
-        "email": notion_email,
-        "role": role,
-        "branch": branch,
-    }
-
-
-# =========================================================
-# GENERATE RESET TOKEN
-# =========================================================
-
-def generate_reset_token():
-
-    token = secrets.token_urlsafe(32)
-
-    token_hash = hashlib.sha256(
-        token.encode("utf-8")
-    ).hexdigest()
-
-    return token, token_hash
-
-
-# =========================================================
-# CREATE PASSWORD RESET
-# =========================================================
-
-def create_password_reset(email):
-
-    user_page = get_user_by_email(
-        email
-    )
-
-    if not user_page:
-
-        return True, None
-
-    token, token_hash = (
-        generate_reset_token()
-    )
-
-    expires = (
-        datetime.now(
-            timezone.utc
-        )
-        + timedelta(
-            minutes=30
-        )
-    )
-
-    properties = {
-
-        "Reset Token Hash": {
-            "rich_text": [
-                {
-                    "text": {
-                        "content":
-                            token_hash
-                    }
-                }
-            ]
-        },
-
-        "Reset Expires": {
-            "date": {
-                "start":
-                    expires.isoformat()
-            }
-        }
-    }
-
-    success = update_user_properties(
-        user_page["id"],
-        properties
-    )
-
-    if not success:
-
-        return False, None
-
-    return True, token
-
-
-# =========================================================
-# FIND USER BY RESET TOKEN
-# =========================================================
-
-def find_user_by_reset_token(token):
-
-    token_hash = hashlib.sha256(
-        token.encode("utf-8")
-    ).hexdigest()
-
-    url = (
-        "https://api.notion.com/v1/data_sources/"
-        f"{NOTION_USERS_DATA_SOURCE_ID}/query"
-    )
-
-    payload = {
-
-        "filter": {
-
-            "property":
-                "Reset Token Hash",
-
-            "rich_text": {
-                "equals":
-                    token_hash
-            }
-        }
-    }
 
     try:
 
-        response = requests.post(
-            url,
-            headers=NOTION_HEADERS,
-            json=payload,
-            timeout=15
+        encoded_payload, signature = (
+            token.split(
+                ".",
+                1
+            )
         )
 
-    except requests.RequestException:
+        expected_signature = hmac.new(
+            AUTH_SECRET.encode(
+                "utf-8"
+            ),
+            encoded_payload.encode(
+                "utf-8"
+            ),
+            hashlib.sha256
+        ).hexdigest()
+
+        if not hmac.compare_digest(
+            signature,
+            expected_signature
+        ):
+            return None
+
+        padding = (
+            "="
+            * (
+                -len(
+                    encoded_payload
+                )
+                % 4
+            )
+        )
+
+        payload = json.loads(
+            base64.urlsafe_b64decode(
+                (
+                    encoded_payload
+                    + padding
+                ).encode(
+                    "utf-8"
+                )
+            )
+            .decode(
+                "utf-8"
+            )
+        )
+
+        if (
+            payload.get(
+                "purpose"
+            )
+            != "password_reset"
+        ):
+            return None
+
+        now_timestamp = int(
+            datetime.now(
+                timezone.utc
+            ).timestamp()
+        )
+
+        if (
+            now_timestamp
+            >= int(
+                payload.get(
+                    "exp",
+                    0
+                )
+            )
+        ):
+            return None
+
+        return payload
+
+    except Exception:
 
         return None
 
-    if response.status_code != 200:
+
+def get_auth_user_by_id(
+    user_id
+):
+
+    try:
+
+        response = (
+            supabase_admin
+            .auth
+            .admin
+            .get_user_by_id(
+                str(
+                    user_id
+                )
+            )
+        )
+
+    except Exception:
 
         return None
 
-    results = response.json().get(
-        "results",
-        []
+    return getattr(
+        response,
+        "user",
+        None
     )
 
-    if not results:
+
+def create_password_reset(
+    email
+):
+
+    email = (
+        email
+        or ""
+    ).strip().lower()
+
+    st.session_state[
+        "password_reset_detail"
+    ] = None
+
+    profile = (
+        get_profile_by_email(
+            email
+        )
+    )
+
+    if not profile:
+
+        profile_error = (
+            st.session_state.get(
+                "supabase_profile_error"
+            )
+        )
+
+        if profile_error:
+
+            st.session_state[
+                "password_reset_detail"
+            ] = (
+                "Unable to read public.profiles: "
+                f"{profile_error}"
+            )
+
+            return {
+                "success": False,
+                "account_found": False,
+                "token": None,
+            }
+
+        st.session_state[
+            "password_reset_detail"
+        ] = (
+            "No matching profile was found for this email."
+        )
+
+        return {
+            "success": True,
+            "account_found": False,
+            "token": None,
+        }
+
+    if not profile.get(
+        "active",
+        True
+    ):
+
+        st.session_state[
+            "password_reset_detail"
+        ] = (
+            "The matching profile is inactive."
+        )
+
+        return {
+            "success": True,
+            "account_found": False,
+            "token": None,
+        }
+
+    auth_user = (
+        get_auth_user_by_id(
+            profile.get(
+                "id"
+            )
+        )
+    )
+
+    if not auth_user:
+
+        st.session_state[
+            "password_reset_detail"
+        ] = (
+            "Profile found, but the matching "
+            "Supabase Authentication user was not found."
+        )
+
+        return {
+            "success": False,
+            "account_found": True,
+            "token": None,
+        }
+
+    token = (
+        generate_reset_token(
+            profile
+        )
+    )
+
+    if not token:
+
+        st.session_state[
+            "password_reset_detail"
+        ] = (
+            "The reset token could not be generated."
+        )
+
+        return {
+            "success": False,
+            "account_found": True,
+            "token": None,
+        }
+
+    st.session_state[
+        "password_reset_detail"
+    ] = (
+        "Profile and Authentication user found. "
+        "Reset token created."
+    )
+
+    return {
+        "success": True,
+        "account_found": True,
+        "token": token,
+    }
+
+
+
+def find_user_by_reset_token(
+    token
+):
+
+    payload = decode_reset_token(
+        token
+    )
+
+    if not payload:
+        return None
+
+    profile = get_profile_by_id(
+        payload.get(
+            "id"
+        )
+    )
+
+    if not profile:
+        return None
+
+    if (
+        normalize_text(
+            profile.get(
+                "email"
+            )
+        )
+        != normalize_text(
+            payload.get(
+                "email"
+            )
+        )
+    ):
 
         return None
 
-    return results[0]
+    auth_user = get_auth_user_by_id(
+        profile[
+            "id"
+        ]
+    )
+
+    if not auth_user:
+        return None
+
+    user_metadata = (
+        getattr(
+            auth_user,
+            "user_metadata",
+            None
+        )
+        or {}
+    )
+
+    if (
+        user_metadata.get(
+            "password_reset_nonce"
+        )
+        != payload.get(
+            "nonce"
+        )
+    ):
+
+        return None
+
+    return profile
+
 
 
 # =========================================================
@@ -2974,98 +4145,492 @@ def send_reset_email(
     reset_link
 ):
 
+    if not RESEND_API_KEY:
+
+        return (
+            False,
+            "RESEND_API_KEY is not configured."
+        )
+
+    if not RESET_EMAIL_SENDER:
+
+        return (
+            False,
+            "RESET_EMAIL_SENDER is not configured."
+        )
+
     try:
 
-        resend.Emails.send(
-            {
-                "from": RESET_EMAIL_SENDER,
+        result = (
+            resend.Emails.send(
+                {
+                    "from":
+                        RESET_EMAIL_SENDER,
 
-                "to": [
-                    email
-                ],
+                    "to": [
+                        email
+                    ],
 
-                "subject":
-                    "Wiginton Tools - Password Reset",
+                    "subject":
+                        "Wiginton Tools - Password Reset",
 
-                "html": f"""
-                <div style="
-                    font-family: Arial, Helvetica, sans-serif;
-                    max-width: 600px;
-                    margin: auto;
-                    padding: 30px;
-                    color: #222222;
-                ">
-
-                    <h2>
-                        Wiginton Tools
-                    </h2>
-
-                    <p>
-                        We received a request to reset
-                        your Wiginton Tools password.
-                    </p>
-
-                    <p>
-                        Click the button below to create
-                        a new password.
-                    </p>
-
-                    <p style="
-                        margin: 30px 0;
+                    "html": f"""
+                    <div style="
+                        font-family: Arial, Helvetica, sans-serif;
+                        max-width: 600px;
+                        margin: auto;
+                        padding: 30px;
+                        color: #222222;
                     ">
 
-                        <a
-                            href="{reset_link}"
-                            style="
-                                background: #0068c9;
-                                color: white;
-                                padding: 12px 22px;
-                                text-decoration: none;
-                                border-radius: 6px;
-                                display: inline-block;
-                            "
-                        >
-                            Reset Password
-                        </a>
+                        <h2>
+                            Wiginton Tools
+                        </h2>
 
-                    </p>
+                        <p>
+                            We received a request to reset
+                            your Wiginton Tools password.
+                        </p>
 
-                    <p>
-                        This link is valid for 30 minutes.
-                    </p>
+                        <p>
+                            Click the button below to create
+                            a new password.
+                        </p>
 
-                    <p>
-                        If you did not request this password
-                        reset, you can ignore this email.
-                    </p>
+                        <p style="
+                            margin: 30px 0;
+                        ">
 
-                    <hr>
+                            <a
+                                href="{reset_link}"
+                                style="
+                                    background: #0068c9;
+                                    color: white;
+                                    padding: 12px 22px;
+                                    text-decoration: none;
+                                    border-radius: 6px;
+                                    display: inline-block;
+                                "
+                            >
+                                Reset Password
+                            </a>
 
-                    <p style="
-                        font-size: 12px;
-                        color: #777777;
-                    ">
-                        Wiginton Tools
-                    </p>
+                        </p>
 
-                </div>
-                """
-            }
+                        <p>
+                            This link is valid for 30 minutes.
+                        </p>
+
+                        <p>
+                            If you did not request this password
+                            reset, you can ignore this email.
+                        </p>
+
+                        <hr>
+
+                        <p style="
+                            font-size: 12px;
+                            color: #777777;
+                        ">
+                            Wiginton Tools
+                        </p>
+
+                    </div>
+                    """
+                }
+            )
         )
 
+        email_id = None
+
+        if isinstance(
+            result,
+            dict
+        ):
+
+            email_id = (
+                result.get(
+                    "id"
+                )
+            )
+
+        else:
+
+            email_id = getattr(
+                result,
+                "id",
+                None
+            )
+
+        return (
+            True,
+            email_id
+            or "Accepted by Resend."
+        )
+
+    except Exception as error:
+
+        return (
+            False,
+            str(
+                error
+            )
+        )
+
+
+
+# =========================================================
+# PERSISTENT LOGIN HELPERS
+# =========================================================
+
+def get_auth_expiration():
+
+    now = datetime.now(
+        LOCAL_TIMEZONE
+    )
+
+    ten_hours_later = (
+        now
+        + timedelta(
+            hours=AUTH_DURATION_HOURS
+        )
+    )
+
+    next_midnight = (
+        now.replace(
+            hour=0,
+            minute=0,
+            second=0,
+            microsecond=0
+        )
+        + timedelta(
+            days=1
+        )
+    )
+
+    return min(
+        ten_hours_later,
+        next_midnight
+    )
+
+
+def encode_auth_payload(payload):
+
+    payload_json = json.dumps(
+        payload,
+        separators=(",", ":"),
+        sort_keys=True
+    )
+
+    return (
+        base64.urlsafe_b64encode(
+            payload_json.encode(
+                "utf-8"
+            )
+        )
+        .decode(
+            "utf-8"
+        )
+    )
+
+
+def decode_auth_payload(encoded_payload):
+
+    padding = (
+        "="
+        * (-len(encoded_payload) % 4)
+    )
+
+    payload_json = (
+        base64.urlsafe_b64decode(
+            (
+                encoded_payload
+                + padding
+            ).encode(
+                "utf-8"
+            )
+        )
+        .decode(
+            "utf-8"
+        )
+    )
+
+    return json.loads(
+        payload_json
+    )
+
+
+def create_auth_token(user):
+
+    expires = get_auth_expiration()
+
+    payload = {
+        "id": user.get("id") or "",
+        "email": (
+            user.get("email")
+            or ""
+        ).strip().lower(),
+        "exp": int(
+            expires.timestamp()
+        ),
+    }
+
+    encoded_payload = (
+        encode_auth_payload(
+            payload
+        )
+    )
+
+    signature = hmac.new(
+        AUTH_SECRET.encode(
+            "utf-8"
+        ),
+        encoded_payload.encode(
+            "utf-8"
+        ),
+        hashlib.sha256
+    ).hexdigest()
+
+    token = (
+        f"{encoded_payload}."
+        f"{signature}"
+    )
+
+    return token, expires
+
+
+def validate_auth_token(
+    token
+):
+
+    if not token:
+        return None
+
+    try:
+
+        encoded_payload, signature = (
+            token.split(
+                ".",
+                1
+            )
+        )
+
+        expected_signature = hmac.new(
+            AUTH_SECRET.encode(
+                "utf-8"
+            ),
+            encoded_payload.encode(
+                "utf-8"
+            ),
+            hashlib.sha256
+        ).hexdigest()
+
+        if not hmac.compare_digest(
+            signature,
+            expected_signature
+        ):
+            return None
+
+        payload = decode_auth_payload(
+            encoded_payload
+        )
+
+        expiration_timestamp = int(
+            payload.get(
+                "exp",
+                0
+            )
+        )
+
+        now_timestamp = int(
+            datetime.now(
+                timezone.utc
+            ).timestamp()
+        )
+
+        if (
+            now_timestamp
+            >= expiration_timestamp
+        ):
+            return None
+
+        user_id = (
+            payload.get(
+                "id"
+            )
+        )
+
+        email = (
+            payload.get(
+                "email",
+                ""
+            )
+            .strip()
+            .lower()
+        )
+
+        if not user_id:
+            return None
+
+        profile = get_profile_by_id(
+            user_id
+        )
+
+        if not profile:
+            return None
+
+        if not profile.get(
+            "active",
+            True
+        ):
+            return None
+
+        if (
+            email
+            and normalize_text(
+                profile.get(
+                    "email"
+                )
+            )
+            != normalize_text(
+                email
+            )
+        ):
+            return None
+
+        return {
+            "id":
+                profile.get(
+                    "id"
+                ),
+
+            "name":
+                profile.get(
+                    "name",
+                    ""
+                ),
+
+            "email":
+                profile.get(
+                    "email",
+                    ""
+                ),
+
+            "employee_number":
+                profile.get(
+                    "employee_number",
+                    ""
+                ),
+
+            "role":
+                profile.get(
+                    "role",
+                    "Designer"
+                ),
+
+            "branch":
+                profile.get(
+                    "branch",
+                    ""
+                ),
+        }
+
+    except Exception:
+
+        return None
+
+
+
+def set_authenticated_user(user):
+
+    st.session_state.authenticated = True
+
+    st.session_state.user_id = (
+        user.get("id")
+    )
+
+    st.session_state.user_name = (
+        user.get("name")
+    )
+
+    st.session_state.user_email = (
+        user.get("email")
+    )
+
+    st.session_state.user_role = (
+        user.get("role")
+    )
+
+    st.session_state.user_branch = (
+        user.get("branch")
+    )
+
+
+def save_persistent_login(user):
+
+    token, expires = (
+        create_auth_token(
+            user
+        )
+    )
+
+    cookie_controller.set(
+        AUTH_COOKIE_NAME,
+        token,
+        path="/",
+        expires=expires,
+        secure=AUTH_COOKIE_SECURE,
+        same_site="strict"
+    )
+
+
+def clear_persistent_login():
+
+    try:
+
+        if cookie_controller.get(
+            AUTH_COOKIE_NAME
+        ) is not None:
+
+            cookie_controller.remove(
+                AUTH_COOKIE_NAME,
+                path="/",
+                secure=AUTH_COOKIE_SECURE,
+                same_site="strict"
+            )
+
+    except Exception:
+        pass
+
+
+def restore_persistent_login():
+
+    if st.session_state.authenticated:
         return True
 
-    except Exception as e:
-
-        st.error(
-            "RESEND ERROR:"
+    try:
+        token = cookie_controller.get(
+            AUTH_COOKIE_NAME
         )
+    except Exception:
+        token = None
 
-        st.exception(
-            e
-        )
-
+    if not token:
         return False
+
+    user = validate_auth_token(
+        token
+    )
+
+    if not user:
+        clear_persistent_login()
+        return False
+
+    set_authenticated_user(
+        user
+    )
+
+    return True
 
 
 # =========================================================
@@ -3144,32 +4709,27 @@ def login_page():
                     "Invalid email or password."
                 )
 
+                login_error_detail = (
+                    st.session_state.get(
+                        "login_error_detail"
+                    )
+                )
+
+                if login_error_detail:
+
+                    st.caption(
+                        "Login details: "
+                        f"{login_error_detail}"
+                    )
+
                 return
 
-            st.session_state.authenticated = (
-                True
+            set_authenticated_user(
+                user
             )
 
-            st.session_state.user_id = (
-                user["id"]
-            )
-
-            st.session_state.user_name = (
-                user["name"]
-            )
-
-            st.session_state.user_email = (
-                user["email"]
-            )
-
-            st.session_state.user_role = (
-                user["role"]
-            )
-
-            st.session_state.user_branch = (
-                user.get(
-                    "branch"
-                )
+            save_persistent_login(
+                user
             )
 
             st.rerun()
@@ -3238,12 +4798,6 @@ def create_account_page():
             "Create your Wiginton Tools account."
         )
 
-        if not branch_options:
-
-            st.warning(
-                "No Branch options are available."
-            )
-
         with st.form(
             "create_account_form"
         ):
@@ -3256,6 +4810,12 @@ def create_account_page():
                 "Email",
                 placeholder=
                     "name@wiginton.net"
+            )
+
+            employee_number = (
+                st.text_input(
+                    "Employee Number"
+                )
             )
 
             branch = st.selectbox(
@@ -3301,6 +4861,8 @@ def create_account_page():
             if (
                 not name
                 or not email
+                or not employee_number.strip()
+                or not branch.strip()
                 or branch
                 == "Select a branch..."
                 or not password
@@ -3342,6 +4904,7 @@ def create_account_page():
                     create_user_in_notion(
                         name,
                         email,
+                        employee_number,
                         password,
                         branch
                     )
@@ -3350,7 +4913,8 @@ def create_account_page():
                 if success:
 
                     st.success(
-                        "Account created successfully!"
+                        message
+                        or "Account created successfully!"
                     )
 
                     st.info(
@@ -3400,7 +4964,7 @@ def forgot_password_page():
         )
 
         st.write(
-            "Enter your email address "
+            "Enter your Wiginton email address "
             "to reset your password."
         )
 
@@ -3408,10 +4972,12 @@ def forgot_password_page():
             "forgot_password_form"
         ):
 
-            email = st.text_input(
-                "Email",
-                placeholder=
-                    "name@email.com"
+            email = (
+                st.text_input(
+                    "Email",
+                    placeholder=
+                        "name@wiginton.net"
+                )
             )
 
             reset = (
@@ -3437,54 +5003,114 @@ def forgot_password_page():
 
                 return
 
-            success, token = (
-                create_password_reset(
-                    email
-                )
-            )
+            if not email.endswith(
+                "@wiginton.net"
+            ):
 
-            if not success:
-
-                st.error(
-                    "Unable to process "
-                    "the password reset."
+                st.warning(
+                    "Please use your Wiginton email address."
                 )
 
                 return
 
-            if token:
+            try:
 
-                reset_link = (
-                    f"{APP_URL}"
-                    f"/?reset_token={token}"
+                # Supabase Auth now sends the recovery email.
+                # redirect_to points back to this Streamlit app.
+                auth_key = (
+                    SUPABASE_PUBLIC_KEY
+                    or SUPABASE_SECRET_KEY
                 )
 
-                email_sent = (
-                    send_reset_email(
-                        email,
-                        reset_link
-                    )
+                response = requests.post(
+                    (
+                        f"{SUPABASE_URL}/auth/v1/recover"
+                    ),
+                    headers={
+                        "apikey":
+                            auth_key,
+
+                        "Content-Type":
+                            "application/json",
+                    },
+                    json={
+                        "email":
+                            email,
+
+                        "redirect_to":
+                            APP_URL,
+                    },
+                    timeout=20,
                 )
 
-                if not email_sent:
+                if response.status_code not in (
+                    200,
+                    201,
+                    202,
+                    204,
+                ):
+
+                    try:
+
+                        error_data = (
+                            response.json()
+                        )
+
+                        error_message = (
+                            error_data.get(
+                                "msg"
+                            )
+                            or error_data.get(
+                                "message"
+                            )
+                            or error_data.get(
+                                "error_description"
+                            )
+                            or error_data.get(
+                                "error"
+                            )
+                            or "Unable to send the recovery email."
+                        )
+
+                    except Exception:
+
+                        error_message = (
+                            "Unable to send the recovery email."
+                        )
 
                     st.error(
-                        "Unable to send the "
-                        "password reset email."
+                        "Unable to send the password reset email."
+                    )
+
+                    st.caption(
+                        f"Supabase details: {error_message}"
                     )
 
                     return
 
-            st.success(
-                "If an account exists for that "
-                "email address, a password reset "
-                "link has been sent."
-            )
+                st.success(
+                    "Password recovery request sent."
+                )
 
-            st.caption(
-                "The reset link is valid "
-                "for 30 minutes."
-            )
+                st.caption(
+                    "Check your Wiginton email inbox "
+                    "and follow the link sent by Supabase."
+                )
+
+                st.caption(
+                    "If you do not see the message, "
+                    "check your Junk or Spam folder."
+                )
+
+            except requests.RequestException as error:
+
+                st.error(
+                    "Unable to connect to Supabase Auth."
+                )
+
+                st.caption(
+                    f"Connection details: {error}"
+                )
 
         if st.button(
             "← Back to Sign In",
@@ -3498,87 +5124,14 @@ def forgot_password_page():
             st.rerun()
 
 
+
 # =========================================================
 # RESET PASSWORD PAGE
 # =========================================================
 
 def reset_password_page(
-    token
+    token=None
 ):
-
-    user_page = (
-        find_user_by_reset_token(
-            token
-        )
-    )
-
-    if not user_page:
-
-        st.error(
-            "This password reset link "
-            "is invalid or has already "
-            "been used."
-        )
-
-        return
-
-    properties = user_page.get(
-        "properties",
-        {}
-    )
-
-    expires_prop = (
-        properties.get(
-            "Reset Expires",
-            {}
-        )
-    )
-
-    date_data = (
-        expires_prop.get(
-            "date"
-        )
-    )
-
-    if not date_data:
-
-        st.error(
-            "This password reset "
-            "link is invalid."
-        )
-
-        return
-
-    try:
-
-        expires = (
-            datetime.fromisoformat(
-                date_data["start"]
-            )
-        )
-
-    except Exception:
-
-        st.error(
-            "This password reset "
-            "link is invalid."
-        )
-
-        return
-
-    if (
-        datetime.now(
-            timezone.utc
-        )
-        > expires
-    ):
-
-        st.error(
-            "This password reset "
-            "link has expired."
-        )
-
-        return
 
     st.markdown(
         "<br><br>",
@@ -3596,6 +5149,50 @@ def reset_password_page(
         st.title(
             "🔑 Create New Password"
         )
+
+        query_params = (
+            st.query_params
+        )
+
+        token_hash = (
+            query_params.get(
+                "token_hash"
+            )
+            or token
+        )
+
+        recovery_type = (
+            query_params.get(
+                "type"
+            )
+            or "recovery"
+        )
+
+        if (
+            not token_hash
+            or recovery_type
+            != "recovery"
+        ):
+
+            st.warning(
+                "Open this page using the password "
+                "recovery link sent to your email."
+            )
+
+            if st.button(
+                "← Back to Sign In",
+                use_container_width=True
+            ):
+
+                st.query_params.clear()
+
+                st.session_state.login_view = (
+                    "login"
+                )
+
+                st.rerun()
+
+            return
 
         st.write(
             "Enter your new password below."
@@ -3628,15 +5225,9 @@ def reset_password_page(
 
         if submit:
 
-            if not password:
-
-                st.warning(
-                    "Please enter a new password."
-                )
-
-                return
-
-            if len(password) < 8:
+            if len(
+                password
+            ) < 8:
 
                 st.error(
                     "Password must contain "
@@ -3656,47 +5247,206 @@ def reset_password_page(
 
                 return
 
-            password_hash = (
-                bcrypt.hashpw(
-                    password.encode(
-                        "utf-8"
-                    ),
-                    bcrypt.gensalt()
-                )
-                .decode(
-                    "utf-8"
-                )
-            )
+            if not SUPABASE_PUBLIC_KEY:
 
-            success = (
-                update_user_properties(
-                    user_page["id"],
-                    {
+                st.error(
+                    "SUPABASE_PUBLISHABLE_KEY "
+                    "is not configured."
+                )
 
-                        "Password Hash": {
-                            "rich_text": [
-                                {
-                                    "text": {
-                                        "content":
-                                            password_hash
-                                    }
-                                }
-                            ]
+                return
+
+            try:
+
+                # -------------------------------------------------
+                # STEP 1
+                # Verify the recovery token_hash.
+                # Supabase returns a temporary authenticated session.
+                # -------------------------------------------------
+
+                verify_response = (
+                    requests.post(
+                        (
+                            f"{SUPABASE_URL}"
+                            "/auth/v1/verify"
+                        ),
+                        headers={
+                            "apikey":
+                                SUPABASE_PUBLIC_KEY,
+
+                            "Content-Type":
+                                "application/json",
                         },
+                        json={
+                            "token_hash":
+                                token_hash,
 
-                        "Reset Token Hash": {
-                            "rich_text": []
+                            "type":
+                                "recovery",
                         },
-
-                        "Reset Expires": {
-                            "date": None
-                        }
-                    }
+                        timeout=20,
+                    )
                 )
-            )
 
-            if success:
+                if (
+                    verify_response.status_code
+                    not in (
+                        200,
+                        201,
+                    )
+                ):
 
+                    try:
+
+                        verify_error = (
+                            verify_response.json()
+                        )
+
+                        verify_message = (
+                            verify_error.get(
+                                "msg"
+                            )
+                            or verify_error.get(
+                                "message"
+                            )
+                            or verify_error.get(
+                                "error_description"
+                            )
+                            or verify_error.get(
+                                "error"
+                            )
+                            or (
+                                "The recovery link is "
+                                "invalid or expired."
+                            )
+                        )
+
+                    except Exception:
+
+                        verify_message = (
+                            "The recovery link is "
+                            "invalid or expired."
+                        )
+
+                    st.error(
+                        verify_message
+                    )
+
+                    return
+
+                verify_data = (
+                    verify_response.json()
+                )
+
+                access_token = (
+                    verify_data.get(
+                        "access_token"
+                    )
+                )
+
+                if not access_token:
+
+                    session_data = (
+                        verify_data.get(
+                            "session"
+                        )
+                        or {}
+                    )
+
+                    access_token = (
+                        session_data.get(
+                            "access_token"
+                        )
+                    )
+
+                if not access_token:
+
+                    st.error(
+                        "Supabase verified the recovery "
+                        "link but did not return a session."
+                    )
+
+                    return
+
+                # -------------------------------------------------
+                # STEP 2
+                # Update password using the recovery session.
+                # -------------------------------------------------
+
+                update_response = (
+                    requests.put(
+                        (
+                            f"{SUPABASE_URL}"
+                            "/auth/v1/user"
+                        ),
+                        headers={
+                            "apikey":
+                                SUPABASE_PUBLIC_KEY,
+
+                            "Authorization":
+                                (
+                                    "Bearer "
+                                    f"{access_token}"
+                                ),
+
+                            "Content-Type":
+                                "application/json",
+                        },
+                        json={
+                            "password":
+                                password,
+                        },
+                        timeout=20,
+                    )
+                )
+
+                if (
+                    update_response.status_code
+                    not in (
+                        200,
+                        201,
+                    )
+                ):
+
+                    try:
+
+                        update_error = (
+                            update_response.json()
+                        )
+
+                        update_message = (
+                            update_error.get(
+                                "msg"
+                            )
+                            or update_error.get(
+                                "message"
+                            )
+                            or update_error.get(
+                                "error_description"
+                            )
+                            or update_error.get(
+                                "error"
+                            )
+                            or (
+                                "Unable to update "
+                                "the password."
+                            )
+                        )
+
+                    except Exception:
+
+                        update_message = (
+                            "Unable to update "
+                            "the password."
+                        )
+
+                    st.error(
+                        update_message
+                    )
+
+                    return
+
+                # Clear recovery parameters after success.
                 st.query_params.clear()
 
                 st.session_state.login_view = (
@@ -3707,18 +5457,30 @@ def reset_password_page(
                     "Password changed successfully."
                 )
 
+                st.info(
+                    "Return to Sign In and use "
+                    "your new password."
+                )
+
                 if st.button(
                     "Return to Sign In",
-                    use_container_width=True
+                    use_container_width=True,
+                    type="primary"
                 ):
 
                     st.rerun()
 
-            else:
+            except requests.RequestException as error:
 
                 st.error(
-                    "Unable to change password."
+                    "Unable to connect to Supabase Auth."
                 )
+
+                st.caption(
+                    "Connection details: "
+                    f"{error}"
+                )
+
 
 
 # =========================================================
@@ -3726,6 +5488,8 @@ def reset_password_page(
 # =========================================================
 
 def logout():
+
+    clear_persistent_login()
 
     st.session_state.authenticated = (
         False
@@ -3754,13 +5518,40 @@ reset_token = (
     )
 )
 
-if reset_token:
+recovery_token_hash = (
+    st.query_params.get(
+        "token_hash"
+    )
+)
+
+recovery_type = (
+    st.query_params.get(
+        "type"
+    )
+)
+
+if (
+    reset_token
+    or (
+        recovery_token_hash
+        and recovery_type
+        == "recovery"
+    )
+):
 
     reset_password_page(
         reset_token
     )
 
     st.stop()
+
+
+# =========================================================
+# RESTORE PERSISTENT LOGIN
+# =========================================================
+
+if not st.session_state.authenticated:
+    restore_persistent_login()
 
 
 # =========================================================
@@ -3922,8 +5713,14 @@ permit = st.Page(
     icon="📋"
 )
 
+aml = st.Page(
+    "pages/14_AML.py",
+    title="AML",
+    icon="📦"
+)
+
 dashboard = st.Page(
-    "pages/14_Dashboard.py",
+    "pages/15_Dashboard.py",
     title="Dashboard",
     icon="📊"
 )
@@ -3999,6 +5796,7 @@ project_management_pages = [
     forecast,
     time_log,
     permit,
+    aml,
 ]
 
 # Dashboard is available only to Managers.
